@@ -94,9 +94,9 @@ def test_availability_is_stock_minus_open_requests(sheet_client):
 
     assert st("Bandage") == "Available"
     r, _ = _post(c, items=[{"item_name": "Bandage", "quantity": 49}])
-    assert st("Bandage") == "Available"  # Under Review holds nothing: anonymous, unvetted
+    assert st("Bandage") == "Limited"  # Under Review holds it: 1 left
     approve(r)
-    assert st("Bandage") == "Limited"  # 1 left
+    assert st("Bandage") == "Limited"  # still 1 left once Approved
     r, _ = _post(c, items=[{"item_name": "Bandage", "quantity": 1}])
     approve(r)
     assert st("Bandage") == "Requested"  # 0 left
@@ -118,7 +118,8 @@ def test_limits(client):
     for extra in bad_bodies:
         body = {"org_name": "O", "org_email": "o@x.org", "items": [ok], **extra}
         assert client.post("/requests", json=body).status_code == 422, str(extra)[:60]
-    body = {"org_name": "O", "org_email": "o@x.org", "items": [ok] * 100}
+    body = {"org_name": "O", "org_email": "o@x.org",  # an unstocked supply: this checks the 100-line cap, not stock
+            "items": [{"item_name": "Not stocked", "quantity": 1}] * 100}
     assert client.post("/requests", json=body).status_code == 200
 
 

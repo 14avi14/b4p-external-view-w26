@@ -94,3 +94,98 @@ def ping() -> bool:
         return True
     except Exception:
         return False
+
+
+# --- accounts (docs/AUTH_PLAN.md; app/accounts.py picks this or a local file) -------------------
+# Thin wrappers over the account functions of the B4P database (Blueprints_DB, sql/schema.sql).
+# Password hashes and token digests come from app/auth.py; nothing here sees a password or a token.
+
+def _value(sql: str, params=None):
+    """First column of the first row (None if there is no row)."""
+    with _connect() as conn:
+        row = conn.execute(sql, params).fetchone()
+    return next(iter(row.values())) if row else None
+
+
+def accounts_ready() -> bool:
+    """True if this database has the account tables (the schema proposal may not be applied yet)."""
+    try:
+        return _value("SELECT to_regclass('account') IS NOT NULL") is True
+    except Exception:
+        return False
+
+
+def create_account(email: str, org_name: str, password_hash: str) -> "int | None":
+    """The new account id, or None if that email already has an account."""
+    try:
+        return _value("SELECT create_account(%s, %s, %s)", (email, org_name, password_hash))
+    except psycopg.errors.UniqueViolation:
+        return None
+
+
+def account_login(email: str) -> "dict | None":
+    """{"account_id", "password_hash", "verified", "locked", "disabled"} or None."""
+    rows = _query("SELECT * FROM account_login(%s)", (email,))
+    return rows[0] if rows else None
+
+
+def record_failed_login(account_id: int) -> None:
+    _value("SELECT record_login(%s, false)", (account_id,))
+
+
+def start_session(account_id: int, token_hash: bytes, days: int) -> None:
+    """A correct password was given: clear the failed count and open a session."""
+    with _connect() as conn:
+        conn.execute("SELECT record_login(%s, true)", (account_id,))
+        conn.execute("SELECT create_session(%s, %s, make_interval(days => %s))", (account_id, token_hash, days))
+
+
+def session_account(token_hash: bytes) -> "dict | None":
+    """{"account_id", "email", "org_name", "role"} for a live session, else None."""
+    rows = _query("SELECT * FROM session_account(%s)", (token_hash,))
+    return rows[0] if rows else None
+
+
+def account_created_at(account_id: int):
+    return _value("SELECT created_at FROM account WHERE account_id = %s", (account_id,))
+
+
+def end_session(token_hash: bytes) -> bool:
+    return bool(_value("SELECT end_session(%s)", (token_hash,)))
+
+
+def create_reset_token(email: str, token_hash: bytes, hours: int) -> bool:
+    """A reset link made by the Blueprints team. False if no usable account has that email."""
+    return bool(_value("SELECT create_account_token(%s, 'reset_password', %s, make_interval(hours => %s))",
+                       (email, token_hash, hours)))
+
+
+def reset_password_account(token_hash: bytes, password_hash: str) -> "int | None":
+    """Redeem a reset link and set the new password, in one transaction. The account id, or None."""
+    with _connect() as conn:
+        account_id = conn.execute(
+            "SELECT use_account_token('reset_password', %s) AS id", (token_hash,)).fetchone()["id"]
+        if account_id is None:
+            return None
+        conn.execute("SELECT set_password(%s, %s)", (account_id, password_hash))
+        return account_id
+
+
+def set_password(account_id: int, password_hash: str) -> bool:
+    """Also signs the account out everywhere."""
+    return bool(_value("SELECT set_password(%s, %s)", (account_id, password_hash)))
+
+
+def list_accounts() -> list[dict]:
+    """Every usable account, for the team dashboard. No hashes."""
+    return _query("""
+        SELECT a.email::TEXT AS email, r.org_name::TEXT AS org_name, a.role, a.created_at, a.last_login_at,
+               COALESCE(a.locked_until > now(), false) AS locked
+          FROM account a JOIN requester r ON r.requester_id = a.requester_id
+         WHERE a.disabled_at IS NULL
+         ORDER BY r.org_name, a.email""")
+
+
+def set_account_role(email: str, role: str) -> bool:
+    with _connect() as conn:
+        return conn.execute("UPDATE account SET role = %s WHERE email = %s::CITEXT", (role, email.strip())).rowcount > 0

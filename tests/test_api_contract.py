@@ -222,17 +222,22 @@ def test_list_by_email_row_shape(client):
 
 # --- validation boundaries -------------------------------------------------------
 
+# Bounds are about the request's shape, so these ask for a supply that isn't stocked (stock is
+# checked separately: test_flows.py, test_exploits.py).
+UNSTOCKED = "Bounds test supply (not in the inventory)"
+
+
 @pytest.mark.parametrize("qty,ok", [(0, False), (-1, False), (1, True), (10000, True),
                                     (10001, False), (1.5, False), (5.5, False), (None, False), ("abc", False),
                                     ("5", False), (True, False), (False, False), ([5], False), ({"n": 5}, False)])
 def test_quantity_bounds(client, qty, ok):
-    r = _post(client, items=[{"item_name": _name(client), "quantity": qty}])
+    r = _post(client, items=[{"item_name": UNSTOCKED, "quantity": qty}])
     assert r.status_code == (200 if ok else 422), r.text
 
 
 @pytest.mark.parametrize("n,ok", [(0, False), (1, True), (100, True), (101, False)])
 def test_item_count_bounds(client, n, ok):
-    r = _post(client, items=[{"item_name": _name(client), "quantity": 1}] * n)
+    r = _post(client, items=[{"item_name": UNSTOCKED, "quantity": 1}] * n)
     assert r.status_code == (200 if ok else 422), r.text
 
 
@@ -400,7 +405,7 @@ class FakeSpreadsheet:
         self.sheet1, self.requests = inventory, requests
 
     def worksheet(self, title):
-        return self.requests
+        return self.sheet1 if title == "Final Inventorying" else self.requests
 
 
 @pytest.fixture

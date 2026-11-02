@@ -148,3 +148,38 @@ def test_approved_hold_without_lot_keeps_first_lot_first(monkeypatch):
 def test_named_lot_overflow_spills_to_other_rows_of_the_name(monkeypatch):
     inv = [_row(2, "A", 10), _row(3, "B", 3)]
     assert _holds(monkeypatch, inv, [("Gloves [Lot B, Box 1, Pallet 2]", 5)]) == {2: 8, 3: 0}
+
+
+def test_service_account_mode_reads_the_final_inventorying_tab_by_default(monkeypatch):
+    """Without INVENTORY_WORKSHEET_TITLE, the "Final Inventorying" tab, not whichever tab is first."""
+    import gspread
+    import main
+
+    class Tab:
+        def __init__(self, rows):
+            self.rows = rows
+
+        def get_all_values(self):
+            return self.rows
+
+    final = Tab([["Name", "Quantity"], ["Gauze", "3"]])
+
+    class Book:
+        sheet1 = Tab([["Old tab"], ["not the inventory"]])
+
+        def worksheet(self, title):
+            if title == "Final Inventorying":
+                return final
+            raise gspread.WorksheetNotFound(title)
+
+    class Client:
+        def open_by_key(self, key):
+            return Book()
+
+    monkeypatch.setenv("GOOGLE_SHEET_ID", "sheet-123")
+    monkeypatch.delenv("INVENTORY_WORKSHEET_TITLE", raising=False)
+    monkeypatch.setattr(main, "_gspread_client", lambda: Client())
+    assert [r["Name"] for r in main._read_sheet_inventory()] == ["Gauze"]
+    final.rows = None
+    Book.worksheet = lambda self, title: (_ for _ in ()).throw(gspread.WorksheetNotFound(title))
+    assert main._read_sheet_inventory()[0]["Old tab"] == "not the inventory"  # no such tab: the first one

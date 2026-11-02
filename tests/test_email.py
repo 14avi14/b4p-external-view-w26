@@ -9,7 +9,7 @@ from app.services import email as e
 
 REAL_SEND = e._send  # captured at import, before the autouse no_email fixture patches it
 
-ITEMS = [{"item_name": "Gauze", "quantity": 2}]
+ITEMS = [{"item_name": "Bandage", "quantity": 1}]  # 50 in stock: room for the many-request tests
 ENV_VARS = ("RESEND_API_KEY", "BREVO_API_KEY", "GMAIL_USER", "GMAIL_APP_PASSWORD",
             "EMAIL_FROM", "EMAIL_REPLY_TO")
 
@@ -330,7 +330,7 @@ def test_suffixed_approved_request_holds_stock_like_a_plain_one(sheet_client, no
         rid = sheet_client.post("/requests", json={
             "org_name": "O", "org_email": f"o{n}@example.org",
             "items": [{"item_name": "Gauze" + suffix, "quantity": qty}]}).json()["request_id"]
-        assert _status_of(sheet_client, "Gauze") == "Available"  # Under Review holds nothing
+        assert _status_of(sheet_client, "Gauze") == expected  # Under Review already holds it
         r = sheet_client.patch(f"/requests/{rid}/status", json={"status": "Approved"},
                                headers={"X-HQ-Token": "test-hq-token"})
         assert r.status_code == 200

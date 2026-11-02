@@ -195,7 +195,7 @@ describe('request drawer', () => {
     ));
     at('#/supplies');
     render(<App />);
-    fireEvent.change(await screen.findByLabelText('Search'), { target: { value: 'item 102' } });
+    fireEvent.change(await screen.findByLabelText('Search supplies'), { target: { value: 'item 102' } });
     userEvent.click(await screen.findByRole('button', { name: /^Add Bulk item 102 to request$/ }));
     expect(await screen.findByText(/Your list is full\. It can include up to 100/)).toBeInTheDocument();
     expect(JSON.parse(window.localStorage.getItem(CART_KEY))).toHaveLength(100);
@@ -258,7 +258,7 @@ describe('saved inventory copy', () => {
   ])('a corrupted or outdated saved copy %s is ignored', async (raw) => {
     window.localStorage.setItem(INVENTORY_KEY, raw);
     await renderAt('#/supplies');
-    expect(screen.getByRole('heading', { level: 1, name: 'Request supplies' })).toBeInTheDocument();
+    expect(screen.getByRole('heading', { level: 1, name: 'Welcome, clinic' })).toBeInTheDocument();
   });
 });
 
@@ -332,6 +332,19 @@ describe('review and confirmation', () => {
     expect(JSON.parse(window.localStorage.getItem(CART_KEY))).toHaveLength(3);
   });
 
+  test('not enough left: the server says how many, the list stays, and availability is fetched again', async () => {
+    await toReview();
+    fill();
+    const detail = 'Not enough left for this request (another clinic may have just asked for some). Synthetic 10ml Syringe: only 2 left. Change the amounts on your list, or remove those supplies, then send again.';
+    handlers.submit = () => response(409, { detail });
+    const before = calls.filter((c) => c.path === '/inventory/availability').length;
+    userEvent.click(screen.getByRole('button', { name: 'Send request' }));
+    expect(await screen.findByRole('alert')).toHaveTextContent('Synthetic 10ml Syringe: only 2 left.');
+    await waitFor(() => expect(calls.filter((c) => c.path === '/inventory/availability').length).toBeGreaterThan(before));
+    expect(JSON.parse(window.localStorage.getItem(CART_KEY)).length).toBeGreaterThan(0);
+    expect(screen.queryByRole('heading', { name: 'Request submitted' })).not.toBeInTheDocument();
+  });
+
   test('a retry after a failed submit reuses the same client_request_id; a new request gets a new one', async () => {
     await toReview();
     fill();
@@ -366,7 +379,7 @@ describe('review and confirmation', () => {
     ]);
     await renderAt('#/c/iv-supplies', /^Saline flush$/);
     const row = rowFor('Saline flush');
-    expect(within(row).getByRole('button', { name: '2 batches' })).toHaveAttribute('aria-expanded', 'false');
+    expect(within(row).getByText('7')).toBeInTheDocument(); // both batches in one row; the detail lists them
     userEvent.click(within(row).getByRole('button', { name: /^Add Saline flush to request$/ }));
     const qty = within(row).getByLabelText('Quantity of Saline flush');
     userEvent.clear(qty);
@@ -429,7 +442,7 @@ describe('loading and errors', () => {
     expect(alert).toHaveTextContent('Couldn’t load the supply list');
     handlers.supplies = () => response(200, SUPPLIES);
     userEvent.click(within(alert).getByRole('button', { name: /Try again/ }));
-    expect(await screen.findByRole('heading', { level: 1, name: 'Request supplies' })).toBeInTheDocument();
+    expect(await screen.findByRole('heading', { level: 1, name: 'Welcome, clinic' })).toBeInTheDocument();
     expect(calls.filter((c) => c.path === '/api/supplies').pop().init.cache).toBe('no-cache');
   });
 
@@ -465,3 +478,66 @@ describe('loading and errors', () => {
 // "Low stock" instead of "Only N left", every type tile shown, contact footer, new name.
 
 
+
+describe('one-page inventory (the chapter site layout)', () => {
+  test('expired supplies are hidden until "Hide expired items" is unticked, and can’t be requested', async () => {
+    await renderAt('#/supplies', /^Nitrile gloves$/);
+    expect(screen.queryByText('Old saline bag')).not.toBeInTheDocument();
+    userEvent.click(screen.getByRole('checkbox', { name: 'Hide expired items' }));
+    const row = screen.getByText('Old saline bag').closest('tr');
+    expect(within(row).getAllByText('Expired').length).toBeGreaterThan(0);
+    expect(within(row).queryByRole('button', { name: /^Add/ })).not.toBeInTheDocument();
+  });
+
+  test('Availability, Expiration and Sort by narrow and order the list', async () => {
+    await renderAt('#/supplies', /^Nitrile gloves$/);
+    userEvent.selectOptions(screen.getByLabelText('Availability'), 'Limited quantity');
+    expect(screen.getByRole('button', { name: /^Gauze pads 4x4$/ })).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /^Nitrile gloves$/ })).not.toBeInTheDocument();
+    userEvent.selectOptions(screen.getByLabelText('Availability'), 'Any availability');
+    userEvent.selectOptions(screen.getByLabelText('Expiration'), 'Expired');
+    expect(screen.getByText('Old saline bag')).toBeInTheDocument(); // shown even with the box ticked
+    userEvent.selectOptions(screen.getByLabelText('Expiration'), 'Any expiration');
+    userEvent.selectOptions(screen.getByLabelText('Sort by'), 'Quantity (most first)');
+    const names = screen.getAllByRole('rowheader').map((r) => r.firstChild.textContent);
+    expect(names[0]).toBe('Nitrile gloves');
+  });
+
+  test('closing a supply’s details doesn’t jump the page: going back fires popstate and hashchange', async () => {
+    const jumped = [];
+    Element.prototype.scrollIntoView = jest.fn(function jump() { jumped.push(this.id); });
+    await renderAt('#/supplies', /^Nitrile gloves$/);
+    expect(new Set(jumped)).toEqual(new Set(['inventory'])); // arriving: to the list (again once it has loaded)
+    const before = jumped.length;
+    const name = screen.getByRole('button', { name: /^Nitrile gloves$/ });
+    name.focus();
+    userEvent.click(name);
+    await screen.findByRole('dialog', { name: 'Nitrile gloves' });
+    act(() => {
+      window.history.replaceState(null, '', '/#/supplies'); // what the back button does…
+      window.dispatchEvent(new PopStateEvent('popstate'));
+      window.dispatchEvent(new HashChangeEvent('hashchange')); // …and the browser's second event
+    });
+    await waitFor(() => expect(screen.queryByRole('dialog')).not.toBeInTheDocument());
+    expect(jumped).toHaveLength(before); // closing doesn't jump anywhere
+    expect(name).toHaveFocus();
+  });
+
+  test('a plain #inventory link becomes #/inventory, so going back to it never lets the browser jump', async () => {
+    const jumped = [];
+    Element.prototype.scrollIntoView = jest.fn(function jump() { jumped.push(this.id); });
+    await renderAt('#inventory', /^Nitrile gloves$/);
+    expect(window.location.hash).toBe('#/inventory');
+    expect(jumped).toContain('inventory');
+  });
+
+  test('the old supplies address opens the one page at the inventory, with totals', async () => {
+    const jumped = [];
+    Element.prototype.scrollIntoView = jest.fn(function jump() { jumped.push(this.id); });
+    await renderAt('#/supplies', /^Nitrile gloves$/);
+    expect(jumped).toContain('inventory');
+    const totals = screen.getByRole('region', { name: 'Inventory totals' });
+    expect(within(totals).getByText('Supply types available')).toBeInTheDocument();
+    expect(screen.getByRole('link', { name: 'Browse supplies' })).toHaveAttribute('href', '#/inventory');
+  });
+});

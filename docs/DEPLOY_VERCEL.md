@@ -30,13 +30,22 @@ Pv = Preview, both = P and Pv.
 | `EMAIL_FROM` | P | Verified sender, e.g. `Blueprints for Pangaea <requests@example.org>`. |
 | `HQ_EMAIL` | P | Receives new-request alerts. |
 | `EMAIL_REPLY_TO`, `EMAIL_ON_SUBMIT`, `EMAIL_DAILY_LIMIT` | P, optional | See [EMAIL.md](EMAIL.md). |
+| `PUBLIC_SHEET_READ` | P, optional | `1` reads the inventory through the sheet's public CSV export (no service-account key). The sheet must be shared "anyone with the link can view". |
+| `INVENTORY_WORKSHEET_GID` or `INVENTORY_WORKSHEET_TITLE` | P, optional | Which inventory tab to read (its `gid` from the sheet URL, or its name). |
+| `REQUESTS_WORKSHEET_TITLE` | P, optional | Name of the requests tab when the service account writes it. |
+| `REQUESTS_WEBHOOK_URL`, `REQUESTS_WEBHOOK_SECRET` | P only | The Requests spreadsheet's own Apps Script deployment (from `requests-apps-script.gs`, made on that spreadsheet) and its secret. On Vercel each request goes to the "Requests" tab. Never put the temp sheet's URL here, and never set these in Preview. |
 
 Vercel sets `VERCEL`, `VERCEL_ENV` (`production`, `preview`, `development`) by itself. Do not set
 `USE_SAMPLE_DATA` or `TRUST_PROXY` in Vercel. The rate limit takes the client IP from Vercel's
 `x-vercel-forwarded-for` header (which clients cannot set), then the last `X-Forwarded-For` hop, then the socket address.
 The API docs (`/api/docs`) are off on Vercel; `ENABLE_API_DOCS=1` turns them on.
 
-You need either `DATABASE_URL` or `GOOGLE_CREDENTIALS_JSON` + `GOOGLE_SHEET_ID` in Production.
+You need `DATABASE_URL` in Production: clinics sign in to send a request, and accounts are kept
+only in the database when deployed (without it, sign-in answers "Accounts aren’t available right now"). The
+inventory comes from the database, or from the sheet (`GOOGLE_CREDENTIALS_JSON` + `GOOGLE_SHEET_ID`,
+or `PUBLIC_SHEET_READ=1` + `GOOGLE_SHEET_ID`).
+
+Never set `B4P_QA` on Vercel: it switches the request sheet off (it is for test and QA runs).
 
 ## Safety behaviour
 

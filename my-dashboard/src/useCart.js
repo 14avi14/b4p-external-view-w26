@@ -49,19 +49,58 @@ function lineFrom(item, quantity) {
   };
 }
 
+// Where a list is saved on this device: one per signed-in clinic email, plus one for visitors
+// who aren't signed in. (There is no server-side store for lists yet.)
+export const cartKey = (owner) => (owner ? `${CART_KEY}:${owner.trim().toLowerCase()}` : CART_KEY);
+
+// One line per supply: quantities added together (capped again by reconcile once stock is known).
+function mergeLines(saved, added) {
+  const out = saved.map((l) => ({ ...l }));
+  for (const line of added) {
+    const same = out.find((l) => l.id === line.id);
+    if (same) same.quantity = Math.min(same.quantity + line.quantity, MAX_QTY);
+    else if (out.length < MAX_LINES) out.push(line);
+  }
+  return out;
+}
+
 // Cart keyed by product, persisted in localStorage, quantities capped at stock.
-export default function useCart() {
-  const [lines, setLines] = useState(() => cleanLines(readJSON(CART_KEY, [])));
+// `owner` is the signed-in clinic's email: their list is kept under it, so it's still there
+// after they close the tab or come back another day. Signing in adds anything picked while
+// signed out to their saved list; signing out puts their list away until they sign in again.
+// `loads` changes whenever a saved list is swapped in, so it can be checked against stock.
+export default function useCart(owner = null) {
+  const [lines, setLines] = useState(() => {
+    const own = cleanLines(readJSON(cartKey(owner), []));
+    return owner ? mergeLines(own, cleanLines(readJSON(CART_KEY, []))) : own;
+  });
+  const [loads, setLoads] = useState(0);
 
   const linesRef = useRef(lines);
   linesRef.current = lines;
+  const ownerRef = useRef(owner);
 
-  useEffect(() => writeJSON(CART_KEY, lines), [lines]);
+  // Swap lists when someone signs in or out (runs before the save below).
+  useEffect(() => {
+    const was = ownerRef.current;
+    if (was === owner) return;
+    ownerRef.current = owner;
+    const saved = cleanLines(readJSON(cartKey(owner), []));
+    setLines(owner && !was ? mergeLines(saved, linesRef.current) : saved);
+    setLoads((n) => n + 1);
+  }, [owner]);
+
+  // Save. A signed-in clinic's list now holds anything picked while signed out, so the
+  // visitors' list on this device is emptied.
+  useEffect(() => {
+    writeJSON(cartKey(ownerRef.current), lines);
+    if (ownerRef.current) writeJSON(CART_KEY, []);
+  }, [lines]);
 
   // Keep several open tabs in step.
   useEffect(() => {
     const onStorage = (e) => {
-      if (e.key === CART_KEY) setLines(cleanLines(readJSON(CART_KEY, [])));
+      if (e.key === cartKey(ownerRef.current)) setLines(cleanLines(readJSON(e.key, [])));
     };
     window.addEventListener('storage', onStorage);
     return () => window.removeEventListener('storage', onStorage);
@@ -132,5 +171,5 @@ export default function useCart() {
 
   const totalUnits = lines.reduce((sum, l) => sum + l.quantity, 0);
 
-  return { lines, setQuantity, remove, restore, clear, reconcile, quantityOf, totalUnits };
+  return { lines, setQuantity, remove, restore, clear, reconcile, quantityOf, totalUnits, loads };
 }

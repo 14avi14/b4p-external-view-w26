@@ -1,7 +1,17 @@
 import Icon from './Icons';
 import { useEffect, useRef, useState } from 'react';
 
-// Signed in: the person icon opens a small menu (who is signed in, My requests, Sign out).
+// A section link to where the address already is changes nothing, so jump there directly.
+export function toSection(e) {
+  const href = e.currentTarget.getAttribute('href');
+  if (window.location.hash !== href) return;
+  e.preventDefault();
+  const el = document.getElementById(href.slice(2));
+  if (el) el.scrollIntoView();
+}
+
+// Signed in: the person icon opens a small menu (who is signed in, My requests, Change password,
+// the team dashboard for team accounts, Sign out).
 function AccountMenu({ account, onSignOut }) {
   const ref = useRef(null);
   return (
@@ -17,14 +27,17 @@ function AccountMenu({ account, onSignOut }) {
           <span className="acct__email">{account.email}</span>
         </p>
         <a className="acct__item" href="#/requests" onClick={() => { ref.current.open = false; }}>My requests</a>
-        <a className="acct__item" href="#/team/signin" onClick={() => { ref.current.open = false; }}>Blueprints team sign in</a>
+        <a className="acct__item" href="#/password" onClick={() => { ref.current.open = false; }}>Change password</a>
+        {account.role === 'hq' && (
+          <a className="acct__item" href="#/team" onClick={() => { ref.current.open = false; }}>Team dashboard</a>
+        )}
         <button type="button" className="acct__item" onClick={() => { ref.current.open = false; onSignOut(); }}>Sign out</button>
       </div>
     </details>
   );
 }
 
-// One row: logo (home), Request supplies, then Account and Your list on the right.
+// One row: logo and label (home), the section links, then Account and Your list on the right.
 export default function Header({ view, lineCount, units = 0, onOpenSlip, account, onSignOut, authPage, showSignIn }) {
   // Counts up each time the list grows (a new supply, or more of one), to replay the animation.
   const [bump, setBump] = useState(0);
@@ -42,13 +55,14 @@ export default function Header({ view, lineCount, units = 0, onOpenSlip, account
         {/* The logo alone is the way home. Inlined into the CSS as a data: URI, so the page makes no image requests. */}
         <a className="header__brand" href="#/" aria-label="Blueprints for Pangaea, home">
           <span className="header__logo" aria-hidden="true" />
+          <span className="header__tag" aria-hidden="true">Medical supply<br />requests</span>
         </a>
 
-        <nav className="header__main" aria-label="Main">
-          <a className="btn btn--primary header__request" href="#/supplies"
-            aria-current={view === 'catalog' ? 'page' : undefined}>
-            Request supplies
-          </a>
+        {/* Section links on the one main page, as on the chapter inventory site. */}
+        <nav className="header__main" aria-label="Page sections">
+          <a className="header__request" href="#/inventory" onClick={toSection}>Browse supplies</a>
+          <a className="header__request" href="#/how-it-works" onClick={toSection}>How to request</a>
+          <a className="header__request" href="#/contact" onClick={toSection}>Contact</a>
         </nav>
 
         <div className="header__end">

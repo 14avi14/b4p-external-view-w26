@@ -57,6 +57,10 @@ def test_header_cleaning_and_ragged_rows(monkeypatch):
     class SS:
         sheet1 = WS()
 
+        def worksheet(self, title):  # no "Final Inventorying" tab here: the first tab is read
+            import gspread
+            raise gspread.WorksheetNotFound(title)
+
     class Client:
         def open_by_key(self, key):
             return SS()

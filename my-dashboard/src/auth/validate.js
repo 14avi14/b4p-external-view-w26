@@ -55,11 +55,16 @@ export function emailTypo(value) {
   return fixed === email ? null : fixed;
 }
 
-export const CODE_LENGTH = 6;
+// The same limits as the server (app/auth.py). No rules about symbols or capitals: length is
+// what makes a password hard to guess, and a few words together are easy to remember.
+export const MIN_PASSWORD = 10;
+export const MAX_PASSWORD = 128;
 
-export function codeError(value) {
-  const code = String(value || '').replace(/\s/g, '');
-  if (!code) return `Enter the ${CODE_LENGTH}-digit code from the email.`;
-  if (!new RegExp(`^\\d{${CODE_LENGTH}}$`).test(code)) return `The code is ${CODE_LENGTH} numbers, like 042 913.`;
+export function passwordError(value) {
+  if (!value) return 'Enter a password.';
+  if (value.length < MIN_PASSWORD) {
+    return `Use at least ${MIN_PASSWORD} characters. A few words together works well, like “blue river clinic door”.`;
+  }
+  if (value.length > MAX_PASSWORD) return `Use at most ${MAX_PASSWORD} characters.`;
   return null;
 }

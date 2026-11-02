@@ -778,3 +778,8 @@ describe('driveFileId', () => {
     'https://drive.google.com/file/d/short/view', 'https://drive.google.com/file/d/"><img>/view',
   ])('gives nothing for %s', (url) => expect(id(url)).toBe(''));
 });
+
+test('a sheet name with no letters or digits (just "") falls back to the General name', () => {
+  const item = normalizeItem({ _sheet_row: 9, Name: '""', General: 'surgical needle', Quantity: '3' });
+  expect(item.name).toBe('Surgical needle');
+});

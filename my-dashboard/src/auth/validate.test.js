@@ -1,4 +1,4 @@
-import { cleanEmail, codeError, emailError, emailTypo } from './validate';
+import { cleanEmail, emailError, emailTypo, passwordError } from './validate';
 
 test('emails are trimmed and lowercased before checking', () => {
   expect(cleanEmail('  Ana@Clinic.ORG ')).toBe('ana@clinic.org');
@@ -15,9 +15,10 @@ test('common email typos get a suggestion; real addresses don’t', () => {
   }
 });
 
-test('sign-in codes are six digits; spaces are fine', () => {
-  expect(codeError('042 913')).toBeNull();
-  expect(codeError('')).toMatch(/6-digit/);
-  expect(codeError('12345')).toMatch(/6 numbers/);
-  expect(codeError('12345a')).toMatch(/6 numbers/);
+test('passwords: 10 to 128 characters, nothing else required', () => {
+  expect(passwordError('')).toMatch(/Enter a password/);
+  expect(passwordError('short one')).toMatch(/at least 10/);
+  expect(passwordError('blue river clinic door')).toBeNull();
+  expect(passwordError('aaaaaaaaaa')).toBeNull(); // no symbol or capital rules
+  expect(passwordError('x'.repeat(129))).toMatch(/at most 128/);
 });

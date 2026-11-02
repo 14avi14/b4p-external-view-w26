@@ -1,9 +1,9 @@
 import { useState } from 'react';
-import { badgesFor, daysUntil, formatExpiry, photoPage, photoSrc, stockLabel } from '../inventory';
-import Badges from './Badges';
+import { photoPage, photoSrc, stockLabel } from '../inventory';
 import Dialog from './Dialog';
 import Icon from './Icons';
 import RequestControl from './RequestControl';
+import { Availability, Expiry } from './Status';
 import { ProductIcon } from '../catalogIcons';
 
 // Notes often repeat across lots; show each distinct note once.
@@ -40,16 +40,6 @@ function Photo({ id, name, icon }) {
   );
 }
 
-function expiryText(item) {
-  if (!item.expiry) return 'No use-by date listed';
-  const days = daysUntil(item.expiry);
-  const date = formatExpiry(item.expiry);
-  if (days < 0) return `Expired on ${date}`;
-  if (days === 0) return `Expires today, ${date}`;
-  if (days < 90) return `${date}, in ${days} day${days === 1 ? '' : 's'}`;
-  return date;
-}
-
 export default function ItemDetail({ item, row, onHold, quantity, onQuantity, onClose, missing }) {
   return (
     <Dialog onClose={onClose} labelledBy="item-detail-title" variant="side" className="detail">
@@ -69,9 +59,9 @@ export default function ItemDetail({ item, row, onHold, quantity, onQuantity, on
           <p className="detail__sub">{item.subcategory}, {item.type}</p>
           <h2 id="item-detail-title" className="detail__title">{item.name}</h2>
           <p className="detail__stock num">{stockLabel(item.quantity)}</p>
-          <Badges badges={badgesFor(item, onHold)} />
+          <p className="detail__status"><Availability item={item} /></p>
           {onHold && (
-            <p className="detail__note">Other clinics have already asked for all of this. You can still request it; our team will let you know what we can send.</p>
+            <p className="detail__note">Reserved: other clinics have already asked for all of this, so it can’t be requested right now.</p>
           )}
           {item.needsReview && (
             <p className="detail__note">Our team checks this supply by hand before it ships, so approval may take a little longer.</p>
@@ -82,7 +72,7 @@ export default function ItemDetail({ item, row, onHold, quantity, onQuantity, on
           <dl className="facts">
             <div><dt>Type</dt><dd>{item.general || 'Not listed'}</dd></div>
             <div><dt>Maker</dt><dd>{item.manufacturer || 'Not listed'}</dd></div>
-            <div><dt>{item.lots.length > 1 ? 'Earliest use by' : 'Use by'}</dt><dd>{expiryText(item)}</dd></div>
+            <div><dt>{item.lots.length > 1 ? 'Earliest use by' : 'Use by'}</dt><dd><Expiry date={item.expiry} /></dd></div>
             <div><dt>Warehouse category</dt><dd>{item.category || 'Not listed'}</dd></div>
           </dl>
           <h3 className="detail__h3">
@@ -102,7 +92,7 @@ export default function ItemDetail({ item, row, onHold, quantity, onQuantity, on
                 <tr key={l.id} className={l.expiryState === 'expired' ? 'lots__expired' : undefined}>
                   <td className="num">{l.lot || '–'}</td>
                   <td className="num">{l.box ? `Box ${l.box}` : '–'}</td>
-                  <td className="num">{l.expiry ? formatExpiry(l.expiry) : '–'}{l.expiryState === 'expired' && ' (expired)'}</td>
+                  <td className="num"><Expiry date={l.expiry} /></td>
                   <td className="lots__qty num">{l.quantity == null ? '–' : l.quantity.toLocaleString('en-US')}</td>
                 </tr>
               ))}

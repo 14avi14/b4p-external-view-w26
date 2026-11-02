@@ -2,6 +2,7 @@ import { useRef, useState } from 'react';
 import Icon from './Icons';
 import { EMAIL_RE } from '../auth/validate';
 import { WakingNotice } from './States';
+import { Status } from './Status';
 
 export function validateOrg({ name, email }) {
   const errors = {};
@@ -12,7 +13,7 @@ export function validateOrg({ name, email }) {
   return errors;
 }
 
-export default function CheckoutForm({ lines, totalUnits, org, account, onSignOut, onSubmit, onBack }) {
+export default function CheckoutForm({ lines, products, totalUnits, org, account, onSignOut, onSubmit, onBack }) {
   const [values, setValues] = useState({ name: org.name, email: org.email });
   const [touched, setTouched] = useState({});
   const [serverFields, setServerFields] = useState({});
@@ -74,6 +75,7 @@ export default function CheckoutForm({ lines, totalUnits, org, account, onSignOu
                 <span className="summary__name">
                   {l.name}
                   {l.lotCount > 1 && <span className="summary__lots">From {l.lotCount} batches, soonest use-by date first</span>}
+                  <Status item={products && products.get(l.id)} />
                 </span>
                 <span className="summary__qty num">{l.quantity.toLocaleString('en-US')}</span>
               </li>

@@ -1,12 +1,12 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { ApiError, getAllRequests, setRequestStatus } from '../api';
+import { ApiError, getAccounts, getAllRequests, makeResetLink, setRequestStatus } from '../api';
 import { formatDateTime, groupRequests } from '../inventory';
 import Icon from './Icons';
 import { EmptyState, ErrorState } from './States';
 
-// The Blueprints team dashboard (#/team): which clinics asked for what, with status changes.
-// (Clinics sign in with their email and a code, so there are no access links to hand out.) Status rules and the per-clinic grouping come from
-// the HQ review page in team PR #9; every change is still checked by the server.
+// The Blueprints team dashboard (#/team): which clinics asked for what, with status changes, and
+// clinic accounts with a password reset link for anyone locked out. Status rules and the per-clinic
+// grouping come from the HQ review page in team PR #9; every change is still checked by the server.
 
 // Mirrors _check_transition in main.py: forward only; Deny/Cancel only before shipping.
 export const ACTIONS = {
@@ -62,7 +62,7 @@ export function filterGroups(groups, { status = 'all', clinic = '' } = {}) {
   return groups.filter((g) => s.match(g.status) && (!clinic || (g.org.name || g.org.email || 'Unnamed clinic') === clinic));
 }
 
-function Requests({ session, onSignedOut }) {
+function Requests({ onSignedOut }) {
   const [state, setState] = useState({ status: 'loading', groups: [], error: null });
   const [status, setStatus] = useState('all');
   const [clinic, setClinic] = useState('');
@@ -72,12 +72,12 @@ function Requests({ session, onSignedOut }) {
   const load = useCallback(async () => {
     setState((s) => ({ ...s, status: 'loading', error: null }));
     try {
-      setState({ status: 'done', groups: withOrgs(await getAllRequests(session)), error: null });
+      setState({ status: 'done', groups: withOrgs(await getAllRequests()), error: null });
     } catch (err) {
       if (err.status === 401 || err.status === 403) return onSignedOut();
       setState((s) => ({ ...s, status: 'error', error: err.message }));
     }
-  }, [session, onSignedOut]);
+  }, [onSignedOut]);
   useEffect(() => { load(); }, [load]);
 
   const act = async (g, a) => {
@@ -85,7 +85,7 @@ function Requests({ session, onSignedOut }) {
     setBusy(g.id);
     setActionError(null);
     try {
-      await setRequestStatus(g.id, a.status, session);
+      await setRequestStatus(g.id, a.status);
       await load();
     } catch (err) {
       if (err.status === 401) return onSignedOut();
@@ -190,6 +190,92 @@ function Requests({ session, onSignedOut }) {
   );
 }
 
+// Accounts, with a one-time reset link (24 hours) for anyone who forgot their password. Nothing is
+// emailed: the team member copies the link and sends it however suits the clinic. Making a new
+// link cancels the previous one; the old password keeps working until the link is used.
+function Accounts({ onSignedOut }) {
+  const [state, setState] = useState({ status: 'loading', rows: [], error: null });
+  const [find, setFind] = useState('');
+  const [links, setLinks] = useState({}); // email -> {link, hours} | {error}
+  const [busy, setBusy] = useState(null);
+
+  const load = useCallback(async () => {
+    setState((s) => ({ ...s, status: 'loading', error: null }));
+    try {
+      setState({ status: 'done', rows: await getAccounts(), error: null });
+    } catch (err) {
+      if (err.status === 401 || err.status === 403) return onSignedOut();
+      setState((s) => ({ ...s, status: 'error', error: err.message }));
+    }
+  }, [onSignedOut]);
+  useEffect(() => { load(); }, [load]);
+
+  const reset = async (email) => {
+    setBusy(email);
+    try {
+      const { token, hours } = await makeResetLink(email);
+      const link = `${window.location.origin}${window.location.pathname}#/reset/${token}`;
+      setLinks((l) => ({ ...l, [email]: { link, hours } }));
+    } catch (err) {
+      if (err.status === 401 || err.status === 403) return onSignedOut();
+      setLinks((l) => ({ ...l, [email]: { error: err instanceof ApiError ? err.message : 'That didn’t work. Try again.' } }));
+    } finally {
+      setBusy(null);
+    }
+  };
+  const copy = (text) => navigator.clipboard && navigator.clipboard.writeText(text).catch(() => {});
+
+  const q = find.trim().toLowerCase();
+  const rows = q ? state.rows.filter((a) => `${a.org_name} ${a.email}`.toLowerCase().includes(q)) : state.rows;
+  if (state.status === 'error') return <ErrorState title="Couldn’t load accounts" message={state.error} onRetry={load} />;
+
+  return (
+    <section aria-labelledby="accounts-title" className="team__section">
+      <h2 id="accounts-title" className="section-title">Accounts</h2>
+      <p className="hint">Someone forgot their password? Make a reset link and send it to them by email or text. It works once, for 24 hours.</p>
+      <div className="field team__find">
+        <label htmlFor="account-find">Find an account</label>
+        <input id="account-find" type="search" value={find} onChange={(e) => setFind(e.target.value)} placeholder="Clinic or email" />
+      </div>
+      {rows.length === 0 ? (
+        <p className="hint">{state.status === 'loading' ? 'Loading…' : q ? 'No account matches.' : 'No accounts yet.'}</p>
+      ) : (
+        <div className="team__scroll">
+          <table className="team-table">
+            <thead><tr><th scope="col">Clinic</th><th scope="col">Email</th><th scope="col">Last sign-in</th><th scope="col">Password</th></tr></thead>
+            <tbody>
+              {rows.map((a) => {
+                const made = links[a.email];
+                return (
+                  <tr key={a.email}>
+                    <th scope="row">{a.org_name}{a.role === 'hq' && <span className="hint"> (team)</span>}</th>
+                    <td>{a.email}</td>
+                    <td>{a.last_login_at ? formatDateTime(a.last_login_at) : 'Never'}{a.locked && <span className="hint"> · locked for now</span>}</td>
+                    <td>
+                      {made && made.link ? (
+                        <div className="team__link">
+                          <label className="visually-hidden" htmlFor={`link-${a.email}`}>Reset link for {a.email}</label>
+                          <input id={`link-${a.email}`} readOnly value={made.link} onFocus={(e) => e.target.select()} />
+                          <button type="button" className="btn btn--secondary btn--sm" onClick={() => copy(made.link)}>Copy</button>
+                        </div>
+                      ) : (
+                        <button type="button" className="btn btn--secondary btn--sm" disabled={busy === a.email} onClick={() => reset(a.email)}>
+                          {busy === a.email ? 'Making link…' : 'Reset password'}
+                        </button>
+                      )}
+                      {made && made.error && <p className="form-error" role="alert">{made.error}</p>}
+                    </td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
+      )}
+    </section>
+  );
+}
+
 export default function TeamDashboard({ member, onSignOut }) {
   const titleRef = useRef(null);
   useEffect(() => titleRef.current && titleRef.current.focus(), []);
@@ -199,11 +285,12 @@ export default function TeamDashboard({ member, onSignOut }) {
       <div className="team__top">
         <div>
           <h1 className="page-title" tabIndex={-1} ref={titleRef}>Blueprints team</h1>
-          <p className="hint">Signed in as <strong>{member.name || member.email}</strong>{member.position ? `, ${member.position}` : ''}</p>
+          <p className="hint">Signed in as <strong>{member.email}</strong></p>
         </div>
         <button type="button" className="btn btn--secondary" onClick={onSignOut}>Sign out</button>
       </div>
-      <Requests session={member.token} onSignedOut={onSignOut} />
+      <Requests onSignedOut={onSignOut} />
+      <Accounts onSignedOut={onSignOut} />
     </div>
   );
 }

@@ -28,6 +28,7 @@ export function useMediaQuery(query) {
 }
 
 // Routes: #/ (home)  #/supplies  #/requests  #/item/<row>  #/slip  #/review  #/sent  #/signin[/review|/requests]
+//         #/reset/<token> (team-made password reset link)  #/password (change it, signed in)
 //         #/team (Blueprints team dashboard)  #/team/signin
 // Old addresses still land somewhere sensible: #/guide and #/how-it-works go home, #/c/... to the
 // supplies, #/forgot and #/welcome/... (the password screens) to sign-in.
@@ -37,6 +38,10 @@ export function parseHash(hash) {
   if (view === 'requests') return { view: 'requests' };
   if (view === 'signin') return { view: 'signin', next: ['review', 'requests'].includes(param) ? param : null };
   if (view === 'forgot' || view === 'welcome') return { view: 'signin', next: null };
+  // A password reset link from the Blueprints team: #/reset/<token>. The token stays in the
+  // fragment, which browsers never send to a server.
+  if (view === 'reset') return /^[A-Za-z0-9_-]{20,200}$/.test(param || '') ? { view: 'reset', token: param } : { view: 'signin', next: null };
+  if (view === 'password') return { view: 'password' };
   if (view === 'team') return param === 'signin' ? { view: 'team-signin' } : { view: 'team' };
   if (view === 'supplies' || view === 'c') return { view: 'catalog' };
   if (view === 'review' || view === 'checkout') return { view: 'checkout' };

@@ -110,3 +110,13 @@ def test_never_on_production(monkeypatch):
     monkeypatch.setenv("GOOGLE_SHEET_ID", "sheet-123")
     monkeypatch.setenv("VERCEL_ENV", "production")
     assert not main._public_sheet()
+
+
+def test_only_the_columns_the_site_uses_are_sent(public_client, monkeypatch):
+    client, _ = public_client
+    extra = CSV.replace('"Review","",""', '"Review","Overflow","Team notes"').replace('"No","",""', '"No","x","call Dr. Smith 555-0100"')
+    monkeypatch.setattr(main.requests, "get", lambda url, params=None, timeout=None: FakeResponse(extra))
+    main._inventory_cache.clear()
+    row = client.get("/api/supplies").json()[0]
+    assert "Overflow" not in row and "Team notes" not in row and "555-0100" not in str(row)
+    assert set(row) <= main.PUBLIC_SUPPLY_COLUMNS

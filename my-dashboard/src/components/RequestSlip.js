@@ -1,11 +1,12 @@
 import { MAX_LINES } from '../useCart';
 import Icon from './Icons';
 import QuantityStepper from './QuantityStepper';
+import { Status } from './Status';
 
 const today = () => new Date().toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
 
 // The request (cart), shown in a right-hand drawer.
-export default function RequestSlip({ lines, totalUnits, org, notice, onDismissNotice, onQuantity, onRemove, onOpenItem, onReview, onClear, headingId = 'slip-title', onClose }) {
+export default function RequestSlip({ lines, products, totalUnits, org, notice, onDismissNotice, onQuantity, onRemove, onOpenItem, onReview, onClear, headingId = 'slip-title', onClose }) {
   const empty = lines.length === 0;
   return (
     <section className="slip" aria-labelledby={headingId}>
@@ -49,6 +50,7 @@ export default function RequestSlip({ lines, totalUnits, org, notice, onDismissN
                   {line.max != null ? `${line.max.toLocaleString('en-US')} in stock` : 'Quantity not listed'}
                   {line.lotCount > 1 ? `, from ${line.lotCount} batches` : ''}
                 </span>
+                <Status item={products && products.get(line.id)} />
               </div>
               <div className="slip__qty">
                 <QuantityStepper value={line.quantity} max={line.max} onChange={(n) => onQuantity(line, n)} itemName={line.name} compact />

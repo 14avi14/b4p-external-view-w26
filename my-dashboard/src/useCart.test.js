@@ -1,5 +1,5 @@
 import { act, renderHook } from '@testing-library/react';
-import useCart, { CART_KEY, MAX_LINES, MAX_QTY, capQuantity } from './useCart';
+import useCart, { CART_KEY, MAX_LINES, MAX_QTY, capQuantity, cartKey } from './useCart';
 import useOrg, { ORG_KEY } from './useOrg';
 import { readJSON, writeJSON } from './storage';
 
@@ -185,5 +185,50 @@ describe('useOrg', () => {
     window.localStorage.setItem(ORG_KEY, raw);
     const { result } = renderHook(() => useOrg());
     expect(result.current[0]).toEqual({ name: '', email: '' });
+  });
+});
+
+describe('a signed-in clinic’s saved list', () => {
+  const names = (lines) => lines.map((l) => `${l.name} x${l.quantity}`);
+
+  test('is kept under their email and comes back when they return', () => {
+    const first = renderHook(() => useCart('Ana@Clinic.org'));
+    act(() => { first.result.current.setQuantity(item(1), 3); });
+    first.unmount(); // closed the tab
+    expect(readJSON(cartKey('ana@clinic.org'), [])).toHaveLength(1);
+    expect(readJSON(CART_KEY, [])).toEqual([]); // not left in the visitors' list
+    const later = renderHook(() => useCart('ana@clinic.org'));
+    expect(names(later.result.current.lines)).toEqual(['Item 1 x3']);
+  });
+
+  test('signing in adds what was picked while signed out; signing out puts the list away', () => {
+    writeJSON(cartKey('ana@clinic.org'), [{ id: 1, name: 'Item 1', quantity: 2 }]);
+    const { result, rerender } = renderHook(({ owner }) => useCart(owner), { initialProps: { owner: null } });
+    act(() => { result.current.setQuantity(item(1), 1); });
+    act(() => { result.current.setQuantity(item(2), 4); });
+    const loads = result.current.loads;
+    rerender({ owner: 'ana@clinic.org' });
+    expect(names(result.current.lines)).toEqual(['Item 1 x3', 'Item 2 x4']);
+    expect(result.current.loads).toBe(loads + 1); // so the page re-checks stock
+    expect(readJSON(CART_KEY, [])).toEqual([]);
+    rerender({ owner: null });
+    expect(result.current.lines).toEqual([]);
+    expect(readJSON(cartKey('ana@clinic.org'), [])).toHaveLength(2);
+    rerender({ owner: 'ana@clinic.org' });
+    expect(names(result.current.lines)).toEqual(['Item 1 x3', 'Item 2 x4']);
+  });
+
+  test('another clinic signing in on the same device gets its own list, not the last one', () => {
+    writeJSON(cartKey('a@one.org'), [{ id: 1, name: 'Item 1', quantity: 2 }]);
+    const { result, rerender } = renderHook(({ owner }) => useCart(owner), { initialProps: { owner: 'a@one.org' } });
+    rerender({ owner: 'b@two.org' });
+    expect(result.current.lines).toEqual([]);
+  });
+
+  test('a list saved before this change (visitors’ key) moves into the account on first load', () => {
+    writeJSON(CART_KEY, [{ id: 5, name: 'Item 5', quantity: 1 }]);
+    const { result } = renderHook(() => useCart('ana@clinic.org'));
+    expect(names(result.current.lines)).toEqual(['Item 5 x1']);
+    expect(readJSON(CART_KEY, [])).toEqual([]);
   });
 });

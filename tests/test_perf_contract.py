@@ -130,13 +130,13 @@ def test_availability_etag_changes_after_a_request(big):
     tag = before.headers["etag"]
     rid = big.post("/requests", json={"org_name": "E", "org_email": "e@example.org",
                                       "items": [{"item_name": "Synthetic exam glove small", "quantity": 79}]}).json()["request_id"]
-    # Under Review holds nothing, so the representation (and ETag) is unchanged...
-    assert big.get("/inventory/availability", headers={"If-None-Match": tag}).status_code == 304
-    # ...until HQ approves it
-    assert big.patch(f"/requests/{rid}/status", json={"status": "Approved"}, headers=HQ).status_code == 200
+    # The request holds stock straight away, so a cached copy is stale at once...
     after = big.get("/inventory/availability", headers={"If-None-Match": tag})
     assert after.status_code == 200 and after.headers["etag"] != tag
     assert after.json() != before.json()
+    # ...and denying it gives the units back: the first representation again
+    assert big.patch(f"/requests/{rid}/status", json={"status": "Denied"}, headers=HQ).status_code == 200
+    assert big.get("/inventory/availability", headers={"If-None-Match": tag}).status_code == 304
 
 
 def test_etag_same_for_gzip_and_identity_or_weak(big):

@@ -179,7 +179,8 @@ export const photoPage = (id) => `https://drive.google.com/file/d/${encodeURICom
 export function normalizeItem(raw, today = new Date()) {
   const name = str(raw['Name']);
   const general = str(raw['General']);
-  const usableName = name && name.toLowerCase() !== 'unknown' ? name : '';
+  // "Unknown" or a name with no letters or digits at all (a sheet cell holding just "") isn't a name.
+  const usableName = name && name.toLowerCase() !== 'unknown' && /[A-Za-z0-9]/.test(name) ? name : '';
   const expiry = parseExpiry(raw['Date of Expiration']);
   const fromNotes = usableName || general ? '' : nameFromNotes(raw['Notes']);
   const item = {
@@ -489,11 +490,12 @@ function fefoRank(lot) {
   return lot.expiry ? `0${lot.expiry}` : '1';
 }
 
-// Expired lots are left out entirely: they never show, count or get requested.
-export function groupProducts(items, holds = {}) {
+// Expired lots are left out: they never count or get requested.
+// `{ expired: true }` groups only the expired lots instead: rows to show (greyed, never requestable).
+export function groupProducts(items, holds = {}, { expired = false } = {}) {
   const byKey = new Map();
   for (const item of items) {
-    if (item.unlabelled || item.expiryState === 'expired') continue;
+    if (item.unlabelled || (item.expiryState === 'expired') !== expired) continue;
     const key = productKey(item);
     if (!byKey.has(key)) byKey.set(key, []);
     byKey.get(key).push(item);
@@ -513,7 +515,7 @@ export function groupProducts(items, holds = {}) {
     return {
       ...first,
       manufacturer,
-      id: key,
+      id: expired ? `expired:${key}` : key,
       row: first.id,
       lots,
       quantity: known.length || everyLotHeld ? known.reduce((n, l) => n + l.quantity, 0) : null, // all held: 0 available

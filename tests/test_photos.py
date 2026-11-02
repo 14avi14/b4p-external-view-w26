@@ -93,6 +93,27 @@ def test_product_names_with_numbers_keep_the_photo(photos):
     assert out[2]["Image URL"] == VIEW and out[3]["Image URL"] == VIEW
 
 
+@pytest.mark.parametrize("name,notes", [
+    ("Patient label printer", ""),
+    ("Specimen bag", "patient ID number on the label"),
+    ("Hematology panel", "Shows 'Hematology Panel' and a patient's name"),
+    ("Blood tube rack", "patient blood sample"),
+])
+def test_patient_next_to_an_identifier_or_sample_hides_the_photo(photos, name, notes):
+    assert "Image URL" not in photos(row(2, name, notes=notes))[2]
+
+
+@pytest.mark.parametrize("name,notes", [
+    ("ChloraPrep 3 mL applicator", "Chlorhexidine gluconate cloth patient preoperative skin preparation"),
+    ("Pulse oximeter sensor", "Single-patient use adult sensor"),
+    ("Precision Flow disposable patient circuit", ""),
+    ("Patient slippers, 3XL", ""),
+    ("Suction canister", "Ports labeled 'vacuum', 'patient' and 'tandem'"),
+])
+def test_patient_as_product_wording_keeps_the_photo(photos, name, notes):
+    assert photos(row(2, name, notes=notes))[2]["Image URL"] == VIEW
+
+
 def test_words_that_only_look_similar_keep_the_photo(photos):
     # "Patty", "patch", "DOBUTamine" and lot numbers are not patient details.
     out = photos(row(2, "Hydrocolloid patch", notes="REF 302995"), row(3, "Dobutamine vial"))

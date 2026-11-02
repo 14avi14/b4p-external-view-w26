@@ -11,6 +11,7 @@ import logging
 import os
 import re
 import secrets
+import threading
 import time
 import uuid
 from datetime import datetime, timezone
@@ -31,8 +32,9 @@ import requests
 from fastapi.responses import JSONResponse
 
 from app import db
-from app import clinic_auth
-from app import team
+from app import accounts, auth
+from app import email_check
+from app import request_webhook
 from app.services import email as email_svc
 
 # .env is for local development only; hosted platforms provide real environment variables.
@@ -55,11 +57,15 @@ def _docs_disabled() -> bool:
 _NO_DOCS = {"docs_url": None, "redoc_url": None, "openapi_url": None} if _docs_disabled() else {}
 app = FastAPI(**_NO_DOCS)
 
-ALLOWED_ORIGINS = os.environ.get("ALLOWED_ORIGINS", "http://localhost:3000,http://127.0.0.1:3000").split(",")
+# Exact origins only: the sign-in cookie is allowed on cross-origin calls (credentials), so a
+# wildcard would let any site act as a signed-in clinic. On Vercel the site and API share one origin.
+ALLOWED_ORIGINS = [o.strip() for o in os.environ.get(
+    "ALLOWED_ORIGINS", "http://localhost:3000,http://127.0.0.1:3000").split(",") if o.strip() and o.strip() != "*"]
 app.add_middleware(GZipMiddleware, minimum_size=1000)  # inventory JSON is ~134 KB raw
 app.add_middleware(
     CORSMiddleware,
     allow_origins=ALLOWED_ORIGINS,
+    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -212,11 +218,11 @@ async def _db_error(_, exc: psycopg.Error):
     return JSONResponse(status_code=503, content={"detail": "Database unavailable."})
 
 
-def require_hq(x_hq_token: Optional[str] = Header(default=None),
-               x_team_session: Optional[str] = Header(default=None)) -> None:
-    """HQ-only endpoints: send the shared secret (env HQ_API_TOKEN) in the X-HQ-Token header, or a
-    Blueprints team session (X-Team-Session) from the member sign-in, which only exists off production."""
-    if x_team_session and _team_preview() and team.session_member(x_team_session):
+def require_hq(request: Request, x_hq_token: Optional[str] = Header(default=None)) -> None:
+    """HQ-only endpoints: a signed-in Blueprints team account (role "hq"), or the shared secret
+    (env HQ_API_TOKEN) in the X-HQ-Token header, for scripts."""
+    account = current_account(request)
+    if account and account["role"] == "hq":
         return
     expected = os.environ.get("HQ_API_TOKEN", "").strip()
     if not expected:
@@ -547,13 +553,16 @@ def _read_sheet_inventory() -> list[dict]:
 
     client = _gspread_client()
     spreadsheet = client.open_by_key(sheet_id)
+    # The "Final Inventorying" tab unless INVENTORY_WORKSHEET_TITLE names another (the read-only
+    # public path uses the same default). A tab named in the setting must exist; without the setting
+    # and without that tab, the first tab is read and a warning logged.
     title = os.environ.get("INVENTORY_WORKSHEET_TITLE", "").strip()
-    if title:
-        try:
-            sheet = spreadsheet.worksheet(title)
-        except gspread.WorksheetNotFound:
+    try:
+        sheet = spreadsheet.worksheet(title or "Final Inventorying")
+    except gspread.WorksheetNotFound:
+        if title:
             raise HTTPException(status_code=500, detail=f"Inventory tab '{title}' not found.")
-    else:
+        logger.warning("No 'Final Inventorying' tab: reading the first tab of the inventory sheet.")
         sheet = spreadsheet.sheet1
     all_values = sheet.get_all_values()
     if not all_values:
@@ -695,142 +704,262 @@ def _health_email():
     return None if _auto_sample_preview() else email_svc.provider_name()
 
 
-# --- Blueprints team (member) sign-in, PREVIEW ---------------------------------------------------
-# The 6-digit code comes back in the response instead of by email, so this is off on production.
-# Later: Google sign-in limited to roster emails (see app/team.py).
+# --- Accounts: email + password for clinics and the Blueprints team (docs/AUTH_PLAN.md) ----------
+# Sign up gives a working account at once (no emailed code or link). Stored by app/accounts.py: the
+# database when DATABASE_URL is set, a local file on a computer, nothing when deployed without it.
+# The session is an HttpOnly cookie holding a random token; the store keeps only its SHA-256 digest,
+# so a session can be ended (sign out, password change or reset) and a database copy can't sign in.
+# Forgot password: a team member makes a one-time link on the team dashboard and sends it.
 
-def _team_preview() -> bool:
-    return _vercel_env() != "production"
+SESSION_DAYS = 30
+RESET_HOURS = 24
+LOGIN_LIMIT = 10   # sign-in attempts per IP per minute (the per-account lock is in the store)
+SIGNUP_LIMIT = 5   # accounts made per IP per minute
+# One message for every failed sign-in, so it never says whether the email has an account.
+LOGIN_FAILED = ("Wrong email or password. After 5 wrong tries in a row the account is locked "
+                "for 15 minutes.")
+BAD_LINK = "This reset link has expired or was already used. Ask the Blueprints team for a new one."
+_ACCOUNT_EMAIL_RE = re.compile(r"^[^@\s<>\",;]+@[^@\s<>\",;]+\.[^@\s<>\",;]+$")
 
 
-def _roster() -> dict:
-    return team.load_roster(_gspread_client if _has_google_creds() else None)
+def _deployed() -> bool:
+    return bool(os.environ.get("VERCEL") or os.environ.get("RENDER"))
 
 
-class TeamEmailBody(BaseModel):
+def _store():
+    try:
+        return accounts.store()
+    except accounts.Unavailable:
+        raise HTTPException(status_code=503, detail="Accounts aren’t available right now. Email the Blueprints team.")
+
+
+def _session_cookie() -> str:
+    # The __Host- prefix makes browsers refuse the cookie unless it is Secure, host-only and
+    # Path=/. Plain http://localhost cannot hold a Secure cookie in every browser, hence two names.
+    return "__Host-b4p_session" if _deployed() else "b4p_session"
+
+
+def _set_session_cookie(response: Response, token: str) -> None:
+    response.set_cookie(_session_cookie(), token, max_age=SESSION_DAYS * 86400, path="/",
+                        httponly=True, secure=_deployed(), samesite="lax")
+
+
+def _clear_session_cookie(response: Response) -> None:
+    response.delete_cookie(_session_cookie(), path="/", httponly=True, secure=_deployed(), samesite="lax")
+
+
+def _session_token(request: Request) -> str:
+    token = request.cookies.get(_session_cookie(), "")
+    return token if 0 < len(token) <= 200 else ""
+
+
+def current_account(request: Request) -> Optional[dict]:
+    """The signed-in account ({"account_id", "email", "org_name", "role", "created_at"}) or None.
+    Never raises: without a store nobody is signed in."""
+    token = _session_token(request)
+    if not token:
+        return None
+    try:
+        return accounts.store().session_account(auth.token_hash(token))
+    except accounts.Unavailable:
+        return None
+
+
+def require_account(request: Request, response: Response) -> dict:
+    response.headers["Cache-Control"] = "no-store"  # per-account data must never be cached
+    account = current_account(request)
+    if account is None:
+        raise HTTPException(status_code=401, detail="Please sign in again.", headers={"Cache-Control": "no-store"})
+    return account
+
+
+def _me(account: dict) -> dict:
+    return {"email": account["email"], "org_name": account["org_name"], "role": account["role"]}
+
+
+def _clean_account_email(v: str) -> str:
+    v = unicodedata.normalize("NFKC", v).strip()
+    if not _ACCOUNT_EMAIL_RE.match(v) or len(v) > 254:
+        raise ValueError("must be an email address")
+    return v
+
+
+class SignupBody(BaseModel):
+    email: str = Field(max_length=254)
+    org_name: str = Field(min_length=1, max_length=200)
+    password: str = Field(min_length=auth.MIN_PASSWORD, max_length=auth.MAX_PASSWORD)
+
+    @field_validator("email")
+    @classmethod
+    def email_shape(cls, v: str) -> str:
+        return _clean_account_email(v)
+
+    @field_validator("org_name")
+    @classmethod
+    def org_not_blank(cls, v: str) -> str:
+        v = " ".join(v.split())
+        if not v:
+            raise ValueError("cannot be empty")
+        return _redact_phi(v)
+
+
+class LoginBody(BaseModel):
+    email: str = Field(max_length=254)
+    password: str = Field(min_length=1, max_length=auth.MAX_PASSWORD)
+
+
+class ResetBody(BaseModel):
+    token: str = Field(min_length=20, max_length=200)
+    password: str = Field(min_length=auth.MIN_PASSWORD, max_length=auth.MAX_PASSWORD)
+
+
+class ChangePasswordBody(BaseModel):
+    current_password: str = Field(min_length=1, max_length=auth.MAX_PASSWORD)
+    new_password: str = Field(min_length=auth.MIN_PASSWORD, max_length=auth.MAX_PASSWORD)
+
+
+class ResetLinkBody(BaseModel):
     email: str = Field(max_length=254)
 
 
-class TeamCodeBody(BaseModel):
-    email: str = Field(max_length=254)
-    code: str = Field(max_length=12)
-
-
-NOT_A_MEMBER = "This email isn\u2019t on the Blueprints member list."
-
-
-@app.post("/api/team/sign-in")
-async def team_sign_in(body: TeamEmailBody, request: Request):
-    if not _team_preview():
-        raise HTTPException(status_code=503, detail="Team sign-in isn\u2019t set up on this server yet.")
-    _check_rate("team:" + _client_ip(request), RATE_LIMIT)
-    if not team.is_member(body.email, _roster()):
-        raise HTTPException(status_code=403, detail=NOT_A_MEMBER)
-    # Preview: the code is shown on the page. A real version emails it and returns nothing.
-    return {"sent": True, "preview_code": team.new_code(body.email), "minutes": team.CODE_MINUTES}
-
-
-@app.post("/api/team/verify")
-async def team_verify(body: TeamCodeBody, request: Request):
-    if not _team_preview():
-        raise HTTPException(status_code=503, detail="Team sign-in isn\u2019t set up on this server yet.")
-    _check_rate("team:" + _client_ip(request), RATE_LIMIT)
-    member = team.is_member(body.email, _roster())
-    if not member:
-        raise HTTPException(status_code=403, detail=NOT_A_MEMBER)
-    result = team.check_code(body.email, body.code)
-    if result == "wrong":
-        raise HTTPException(status_code=400, detail="That code isn\u2019t right. Check it and try again.")
-    if result != "ok":
-        raise HTTPException(status_code=400, detail="That code has run out. Ask for a new one.")
-    return {"token": team.start_session(member), "role": "hq", **member}
-
-
-@app.get("/api/team/me")
-async def team_me(response: Response, x_team_session: Optional[str] = Header(default=None)):
+@app.post("/api/auth/signup")
+def auth_signup(body: SignupBody, request: Request, response: Response):
+    """Make the account and sign in. An email that already has an account gets a clear message:
+    with nothing emailed, there's no way to hide that and still help the person."""
+    _check_rate("signup:" + _client_ip(request), SIGNUP_LIMIT)
     response.headers["Cache-Control"] = "no-store"
-    member = team.session_member(x_team_session) if _team_preview() else None
-    if not member:
-        raise HTTPException(status_code=401, detail="Please sign in again.")
-    return {"role": "hq", **member}
+    store = _store()
+    account_id = store.create_account(body.email, body.org_name, auth.hash_password(body.password))
+    if account_id is None:
+        raise HTTPException(status_code=409, detail="That email already has an account. Sign in instead.")
+    token, digest = auth.new_token()
+    store.start_session(account_id, digest, SESSION_DAYS)
+    _set_session_cookie(response, token)
+    return _me(store.session_account(digest))
 
 
-@app.post("/api/team/sign-out")
-async def team_sign_out(x_team_session: Optional[str] = Header(default=None)):
-    team.end_session(x_team_session)
+@app.post("/api/auth/login")
+def auth_login(body: LoginBody, request: Request, response: Response):
+    _check_rate("login:" + _client_ip(request), LOGIN_LIMIT)
+    response.headers["Cache-Control"] = "no-store"
+    failed = HTTPException(status_code=401, detail=LOGIN_FAILED, headers={"Cache-Control": "no-store"})
+    store = _store()
+    row = store.login_row(body.email.strip())
+    if row is None or row["locked"] or row["disabled"]:
+        auth.burn(body.password)  # take as long as a real check would
+        raise failed
+    if not auth.verify_password(body.password, row["password_hash"]):
+        store.record_failed_login(row["account_id"])
+        raise failed
+    token, digest = auth.new_token()
+    store.start_session(row["account_id"], digest, SESSION_DAYS)
+    _set_session_cookie(response, token)
+    return _me(store.session_account(digest))
+
+
+@app.post("/api/auth/logout")
+def auth_logout(request: Request, response: Response):
+    token = _session_token(request)
+    if token:
+        try:
+            accounts.store().end_session(auth.token_hash(token))
+        except accounts.Unavailable:
+            pass
+    _clear_session_cookie(response)
     return {"ok": True}
 
 
-# --- Clinic sign-in: email, then a 6-digit code (app/clinic_auth.py) ----------------------------
-# The code is emailed when an email provider is set. Without one, off production only, it comes
-# back in the response so the page can show it (like the team preview above).
-
-class ClinicEmailBody(BaseModel):
-    email: str = Field(max_length=254)
-
-
-class ClinicCodeBody(BaseModel):
-    email: str = Field(max_length=254)
-    code: str = Field(max_length=12)
-    ticket: str = Field(max_length=1000)
-
-
-def _clinic_auth_ready() -> None:
-    if _vercel_env() == "production" and not (clinic_auth.configured() and email_svc.provider_name()):
-        raise HTTPException(status_code=503, detail="Email sign-in isn’t set up yet. Email the Blueprints team.")
-
-
-@app.post("/api/auth/sign-in")
-async def clinic_sign_in(body: ClinicEmailBody, request: Request):
-    _clinic_auth_ready()
-    email = clinic_auth.clean_email(body.email)
-    if not EMAIL_RE.match(email):
-        raise HTTPException(status_code=422, detail="Enter a valid email address, like name@clinic.org.")
-    _check_rate("auth:" + _client_ip(request), RATE_LIMIT)
-    _check_rate("auth-to:" + email, 3)  # don't let anyone flood one inbox
-    code, ticket = clinic_auth.new_code(email)
-    out = {"sent": True, "ticket": ticket, "minutes": clinic_auth.CODE_MINUTES}
-    if email_svc.provider_name():
-        if not email_svc.send_sign_in_code(email, code, clinic_auth.CODE_MINUTES):
-            raise HTTPException(status_code=502, detail="We couldn’t send the email. Try again in a minute.")
-    else:
-        out["preview_code"] = code  # never on production: _clinic_auth_ready refuses there
-    return out
-
-
-@app.post("/api/auth/verify")
-async def clinic_verify(body: ClinicCodeBody, request: Request):
-    _clinic_auth_ready()
-    _check_rate("auth:" + _client_ip(request), RATE_LIMIT)
-    result = clinic_auth.check_code(body.email, body.code, body.ticket)
-    if result == "wrong":
-        raise HTTPException(status_code=400, detail="That code isn’t right. Check it and try again.")
-    if result != "ok":
-        raise HTTPException(status_code=400, detail="That code has run out. Ask for a new one.")
-    email = clinic_auth.clean_email(body.email)
-    return {"token": clinic_auth.start_session(email), "email": email}
-
-
 @app.get("/api/auth/me")
-async def clinic_me(response: Response, x_clinic_session: Optional[str] = Header(default=None)):
+def auth_me(account: dict = Depends(require_account)):
+    return _me(account)
+
+
+@app.post("/api/auth/password/change")
+def auth_change_password(body: ChangePasswordBody, request: Request, response: Response,
+                         account: dict = Depends(require_account)):
+    """Needs the current password, so a borrowed browser can't take the account over. Wrong
+    guesses count toward the same lock as sign-in. Other browsers are signed out; this one stays in."""
+    _check_rate("login:" + _client_ip(request), LOGIN_LIMIT)
+    store = _store()
+    row = store.login_row(account["email"])
+    wrong = HTTPException(status_code=403, detail="Your current password isn’t right.",
+                          headers={"Cache-Control": "no-store"})
+    if row is None or row["locked"]:
+        auth.burn(body.current_password)
+        raise wrong
+    if not auth.verify_password(body.current_password, row["password_hash"]):
+        store.record_failed_login(row["account_id"])
+        raise wrong
+    store.set_password(row["account_id"], auth.hash_password(body.new_password))
+    token, digest = auth.new_token()
+    store.start_session(row["account_id"], digest, SESSION_DAYS)
+    _set_session_cookie(response, token)
+    return {"ok": True}
+
+
+@app.post("/api/auth/password/reset")
+def auth_reset_password(body: ResetBody, request: Request, response: Response):
+    """Redeem a team-made reset link: set the new password (every other session ends) and sign in."""
+    _check_rate("login:" + _client_ip(request), LOGIN_LIMIT)
     response.headers["Cache-Control"] = "no-store"
-    email = clinic_auth.session_email(x_clinic_session)
-    if not email:
-        raise HTTPException(status_code=401, detail="Please sign in again.")
-    return {"email": email}
+    store = _store()
+    account_id = store.reset_password(auth.token_hash(body.token), auth.hash_password(body.password))
+    if account_id is None:
+        raise HTTPException(status_code=400, detail=BAD_LINK)
+    token, digest = auth.new_token()
+    store.start_session(account_id, digest, SESSION_DAYS)
+    _set_session_cookie(response, token)
+    return _me(store.session_account(digest))
+
+
+# Blueprints team: accounts with role "hq" (made with `python -m app.create_team_account`).
+@app.get("/api/team/accounts", dependencies=[Depends(require_hq)])
+def team_list_accounts(response: Response):
+    response.headers["Cache-Control"] = "no-store"
+    return [{**a, "created_at": str(a.get("created_at") or ""), "last_login_at": str(a.get("last_login_at") or "")}
+            for a in _store().list_accounts()]
+
+
+@app.post("/api/team/accounts/reset-link", dependencies=[Depends(require_hq)])
+def team_reset_link(body: ResetLinkBody, response: Response):
+    """A one-time password reset link for one account, good for RESET_HOURS. Only the token is
+    returned; the page builds the link from its own address, and the store keeps only a digest."""
+    response.headers["Cache-Control"] = "no-store"
+    token, digest = auth.new_token()
+    if not _store().create_reset_token(body.email.strip(), digest, RESET_HOURS):
+        raise HTTPException(status_code=404, detail="No account has that email.")
+    return {"token": token, "hours": RESET_HOURS}
+
+
+# Is this email domain real? Sent the domain only (not the address); see app/email_check.py.
+# The page shows a friendly warning for "no-domain", "no-mail" and "disposable", and never stops
+# anyone on "unknown". Plain def: FastAPI runs it in a thread, so a slow lookup blocks nothing.
+@app.get("/api/auth/check-email")
+def clinic_check_email(domain: str, request: Request, response: Response):
+    _check_rate("check:" + _client_ip(request), 30)
+    response.headers["Cache-Control"] = "no-store"
+    if len(domain) > 253 or not re.fullmatch(r"[A-Za-z0-9.-]+", domain.strip()):
+        return {"domain": domain[:253], "result": "no-domain"}
+    return {"domain": domain.strip().lower(), "result": email_check.check_domain(domain)}
 
 
 @app.get("/health")
 def health():
     if db.enabled():
-        return {"source": "postgres", "ok": db.ping(), "email": _health_email()}
+        out = {"source": "postgres", "ok": db.ping(), "email": _health_email()}
+        if request_webhook.configured():
+            out["requests_sheet"] = request_webhook.status()
+        return out
     if _use_sample_data():
         source = "sample"
     elif _public_sheet():
         source = "sheet-public"  # the live sheet, read-only through its CSV export
     else:
         source = "sheet"
-    return {"source": source, "ok": True, "email": _health_email()}
+    out = {"source": source, "ok": True, "email": _health_email()}
+    if request_webhook.configured():
+        out["requests_sheet"] = request_webhook.status()
+    return out
 
 
 PUBLIC_CACHE = "public, max-age=60, stale-while-revalidate=300"
@@ -852,8 +981,13 @@ def _cached_json(request: Request, data) -> Response:
 _DRIVE_ID_RE = re.compile(r"^[A-Za-z0-9_-]{20,100}$")
 _DRIVE_HOSTS = ("drive.google.com", "docs.google.com")
 # Words that mean a row is about a patient or trial-subject sample: its photo may show the label.
+# "Patient" on its own is product wording ("single patient use", "patient preoperative skin
+# preparation", "patient drape"), so it counts only next to something that identifies a person or
+# a sample taken from one. The short forms (pt, pat) still always count.
 _PATIENT_WORDS_RE = re.compile(
-    r"\b(?:pt|pat|patient)\b|\bmrn\b|\bmed\.?\s*rec|medical\s+record|\bd\.?o\.?b\b|date\s+of\s+birth"
+    r"\b(?:pt|pat)\b|\bpatient(?:'s|s)?\s*(?:id\b|identifier|name|number|no\b|no\.|#|label|sticker|"
+    r"info|record|chart|initials?|\bdob\b|mrn|sample|specimen|blood|urine|plasma|serum|tissue)"
+    r"|\bmrn\b|\bmed\.?\s*rec|medical\s+record|\bd\.?o\.?b\b|date\s+of\s+birth"
     r"|\bsubj(?:ect)?s?\b|\bparticipant|\bpre-?dose|\bpost-?dose|\bscreening\b|\bC\d{1,2}D\d{1,2}\b", re.I)
 # Containers that may hold a used sample (and so carry a patient or subject label): no photo at all.
 _SAMPLE_CONTAINER_RE = re.compile(
@@ -904,10 +1038,19 @@ def _with_safe_photo(raw: dict, redacted: dict) -> dict:
     return out
 
 
+# The only inventory columns the site uses. Anything else in the sheet (a new column, notes for
+# the team, "Overflow", ...) is never sent to the public, and the download stays smaller.
+PUBLIC_SUPPLY_COLUMNS = {
+    "Manufacturer Name", "Category", "Subcategory", "General", "Name", "Lot Number", "Notes", "Quantity",
+    "Date of Expiration", "Pallet Number", "Box Number", "Review", "Image URL", "_sheet_row",
+}
+
+
 @app.get("/api/supplies")
 async def supplies(request: Request):
     raw_rows = _load_inventory_records()
-    rows = [_with_safe_photo(raw, _redact_row(raw)) for raw in raw_rows]
+    rows = [{k: v for k, v in _with_safe_photo(raw, _redact_row(raw)).items() if k in PUBLIC_SUPPLY_COLUMNS}
+            for raw in raw_rows]
     return _cached_json(request, rows)
 
 
@@ -1251,27 +1394,60 @@ def _review_flags(body: OrgRequestBody) -> list[bool]:
     return [_review_flag(inventory, i.item_name) for i in body.items]
 
 
+def _org_request_rows(request_id: str, body: "OrgRequestBody", flags: list[bool], ts: str) -> list[list]:
+    """A request as rows of the Requests tab (ORG_REQ_HEADERS), one per supply."""
+    return [
+        [_sheet_safe(c) for c in [request_id, body.org_name, body.org_email, item.item_name,
+                                  item.category, item.quantity, "Under Review", ts, "TRUE" if flag else "FALSE"]]
+        for item, flag in zip(body.items, flags)
+    ]
+
+
+def _copy_to_request_sheet(request_id: str, body: "OrgRequestBody", flags: list[bool], ts: str) -> str:
+    """Send the request to the Apps Script request sheet, when one is set up ("ok", "failed" or
+    "unknown"; see request_webhook.send). Never raises: a sheet problem is only logged."""
+    if not request_webhook.configured():
+        return "failed"
+    try:
+        return request_webhook.send(ORG_REQ_HEADERS, _org_request_rows(request_id, body, flags, ts), request_id)
+    except Exception:
+        logger.exception("Couldn't copy request %s to the request sheet", request_id)
+        return "unknown"
+
+
+def _sign_in_required() -> bool:
+    return accounts._deployed()
+
+
 @app.post("/requests")
 def submit_org_request(body: OrgRequestBody, tasks: BackgroundTasks, request: Request,
                        _rl: None = Depends(rate_limit_post)):
     client_ip = _client_ip(request)
+    account = current_account(request)
+    if account is None and _sign_in_required():  # live site: only signed-in clinics can hold supplies
+        raise HTTPException(status_code=401, detail="Please sign in to send a request.")
+    if account:  # signed in: the account says who this is, not the browser
+        body = body.model_copy(update={"org_name": _redact_phi(account["org_name"]), "org_email": account["email"]})
     if db.enabled():
         request_id = _request_id_for(body.client_request_id)
-        if body.client_request_id and db.request_exists(request_id):  # already saved: a retry, or a clash
-            if not _same_request(db.request_lines(request_id), body):
-                raise _client_id_conflict()
-            return {"request_id": request_id, "status": "Under Review"}  # a true retry: no second email
-        flags = _review_flags(body)
-        try:  # the inventory item each line was picked from; a lookup failure never blocks the request
-            item_ids = db.item_ids_for_rows([i.sheet_row for i in body.items if i.sheet_row])
-        except Exception:
-            item_ids = {}
-        request_id = db.create_request(body.org_name, body.org_email, [
-            {"item_name": i.item_name, "category": i.category, "quantity": i.quantity,
-             "review_flag": flag,
-             **_item_id_for(i, item_ids)}
-            for i, flag in zip(body.items, flags)
-        ], request_id=request_id if body.client_request_id else None)
+        with _claim_lock:
+            if body.client_request_id and db.request_exists(request_id):  # already saved: a retry, or a clash
+                if not _same_request(db.request_lines(request_id), body):
+                    raise _client_id_conflict()
+                return {"request_id": request_id, "status": "Under Review"}  # a true retry: no second email
+            _check_enough_left(body)
+            flags = _review_flags(body)
+            try:  # the inventory item each line was picked from; a lookup failure never blocks the request
+                item_ids = db.item_ids_for_rows([i.sheet_row for i in body.items if i.sheet_row])
+            except Exception:
+                item_ids = {}
+            request_id = db.create_request(body.org_name, body.org_email, [
+                {"item_name": i.item_name, "category": i.category, "quantity": i.quantity,
+                 "review_flag": flag,
+                 **_item_id_for(i, item_ids)}
+                for i, flag in zip(body.items, flags)
+            ], request_id=request_id if body.client_request_id else None)
+        _copy_to_request_sheet(request_id, body, flags, datetime.now(timezone.utc).isoformat())
         _queue_submit_emails(tasks, body, request_id,
                              [i.item_name for i, flag in zip(body.items, flags) if flag], client_ip)
         return {"request_id": request_id, "status": "Under Review"}
@@ -1281,47 +1457,47 @@ def submit_org_request(body: OrgRequestBody, tasks: BackgroundTasks, request: Re
 
     if _requests_in_memory():
         request_id = _request_id_for(body.client_request_id)
-        existing = [r for r in _sample_org_request_rows if r["Request ID"] == request_id]
-        if body.client_request_id and existing:
-            if not _same_request(existing, body):
-                raise _client_id_conflict()
-            return {"request_id": request_id, "status": "Under Review", "message": "Kept in memory only."}
-        ts = datetime.now(timezone.utc).isoformat()
-        for item, flag in zip(body.items, flags):
-            _sample_org_request_rows.append({
-                "Request ID": request_id, "Org Name": body.org_name,
-                "Org Email": body.org_email, "Item Name": item.item_name,
-                "Category": item.category, "Quantity Requested": str(item.quantity),
-                "Status": "Under Review", "Timestamp": ts, "Review Flag": "TRUE" if flag else "FALSE",
-            })
+        with _claim_lock:
+            existing = [r for r in _sample_org_request_rows if r["Request ID"] == request_id]
+            if body.client_request_id and existing:
+                if not _same_request(existing, body):
+                    raise _client_id_conflict()
+                return {"request_id": request_id, "status": "Under Review", "message": "Kept in memory only."}
+            _check_enough_left(body)
+            ts = datetime.now(timezone.utc).isoformat()
+            for item, flag in zip(body.items, flags):
+                _sample_org_request_rows.append({
+                    "Request ID": request_id, "Org Name": body.org_name,
+                    "Org Email": body.org_email, "Item Name": item.item_name,
+                    "Category": item.category, "Quantity Requested": str(item.quantity),
+                    "Status": "Under Review", "Timestamp": ts, "Review Flag": "TRUE" if flag else "FALSE",
+                })
+        _copy_to_request_sheet(request_id, body, flags, ts)
         _queue_submit_emails(tasks, body, request_id, flagged, client_ip)
         return {"request_id": request_id, "status": "Under Review", "message": "Kept in memory only."}
 
     request_id = _request_id_for(body.client_request_id)
     ts = datetime.now(timezone.utc).isoformat()
 
-    items_payload = [
-        {"item_name": item.item_name, "category": item.category, "quantity": item.quantity, "inventory_key": ""}
-        for item in body.items
-    ]
-
-    batch: list[list] = [
-        [_sheet_safe(c) for c in [request_id, body.org_name, body.org_email, item.item_name,
-                                  item.category, item.quantity, "Under Review", ts, "TRUE" if flag else "FALSE"]]
-        for item, flag in zip(body.items, flags)
-    ]
+    batch = _org_request_rows(request_id, body, flags, ts)
 
     spreadsheet = _open_requests_spreadsheet()
     ws = _org_requests_worksheet(spreadsheet)
-    if body.client_request_id:
-        values = ws.get_all_values()
-        header = values[0] if values else []
-        existing = [_row_dict(header, r) for r in values[1:] if r and r[0] == request_id]
-        if existing:  # already saved: a retry, or a clash
-            if not _same_request(existing, body):
-                raise _client_id_conflict()
-            return {"request_id": request_id, "status": "Under Review"}
-    ws.append_rows(batch, value_input_option="RAW")
+    with _claim_lock:  # here the sheet is the store, so the lock covers writing it
+        if body.client_request_id:
+            values = ws.get_all_values()
+            header = values[0] if values else []
+            existing = [_row_dict(header, r) for r in values[1:] if r and r[0] == request_id]
+            if existing:  # already saved: a retry, or a clash
+                if not _same_request(existing, body):
+                    raise _client_id_conflict()
+                return {"request_id": request_id, "status": "Under Review"}
+        _check_enough_left(body)
+        # One writer per request, never both: the request sheet's web app when it's set up, else (or
+        # when the web app certainly didn't save it) the service account. "unknown" (e.g. a timeout
+        # after sending) may already be saved, so it isn't written again; /health shows the error.
+        if _copy_to_request_sheet(request_id, body, flags, ts) == "failed":
+            ws.append_rows(batch, value_input_option="RAW")
 
     _queue_submit_emails(tasks, body, request_id, flagged, client_ip)
     return {"request_id": request_id, "status": "Under Review"}
@@ -1435,10 +1611,17 @@ async def update_org_request_status(request_id: str, body: StatusUpdateBody, tas
     return {"request_id": request_id, "status": body.status}
 
 
-@app.get("/inventory/availability")
-async def inventory_availability(request: Request):
-    inventory = get_inventory_records()
+# Units a request holds until the team acts on it: shown availability is the sheet quantity minus
+# every Under Review and Approved line. Denied and Cancelled give the units back. Shipped and
+# Delivered are counted by the warehouse taking them off the sheet's quantity, so they don't hold
+# anything here (holding them too would count those units twice).
+HOLDING_STATUSES = ("Under Review", "Approved")
+_HOLDING = {s.casefold() for s in HOLDING_STATUSES}  # the team edits the sheet by hand
+_claim_lock = threading.Lock()  # one submit at a time between "how many are left" and saving it
 
+
+def _request_rows_for_holds() -> list[dict]:
+    """Every request line this server can see (all statuses), as Requests-tab dicts."""
     org_requests: list[dict] = []
     if db.enabled():
         try:
@@ -1447,6 +1630,10 @@ async def inventory_availability(request: Request):
             pass
     elif _requests_in_memory():
         org_requests = list(_sample_org_request_rows)
+        if not _use_sample_data() and request_webhook.configured():
+            # Requests sent from other servers (or before a restart) are only in the request sheet.
+            here = {r.get("Request ID") for r in org_requests}
+            org_requests += [r for r in (request_webhook.active_lines() or []) if r.get("Request ID") not in here]
     else:
         try:
             spreadsheet = _open_requests_spreadsheet()
@@ -1459,73 +1646,123 @@ async def inventory_availability(request: Request):
                         org_requests.append(_row_dict(header, r))
         except Exception:
             pass
+    return org_requests
 
-    # Availability = stock minus what HQ has Approved. Under Review requests are anonymous and
-    # unvetted, so they must not change what other clinics see. Shipped stock is assumed to have
-    # been taken out of the inventory quantity by HQ. Requests are matched by normalized item name.
-    approved_by_name: dict[str, int] = {}
-    approved_exact: dict[tuple, int] = {}  # (name, (lot, box, pallet)) -> qty, for lines naming their lot
+
+def _stock(rec: dict) -> Optional[int]:
+    try:
+        # float() first: Sheets can export whole numbers as "12.0"
+        return max(int(float(str(rec.get("Quantity") or rec.get("quantity") or "").strip().replace(",", ""))), 0)
+    except (ValueError, OverflowError):
+        return None
+
+
+def _remaining_by_row(inventory: list[dict], org_requests: list[dict]) -> tuple[list[Optional[int]], set]:
+    """Per inventory row: units left after the holding requests (None when the sheet has no
+    count), and the names that have any hold."""
+    held_by_name: dict[str, int] = {}
+    held_exact: dict[tuple, int] = {}  # (name, (lot, box, pallet)) -> qty, for lines naming their lot
     for r in org_requests:
-        if r.get("Status", "").strip() == "Approved":
-            full = r.get("Item Name", "")
-            key = _norm_name(_base_item_name(full))
-            try:
-                qty_asked = int(str(r.get("Quantity Requested", "0")).strip())
-            except ValueError:
-                qty_asked = 1
-            qty_asked = max(qty_asked, 0)
-            approved_by_name[key] = approved_by_name.get(key, 0) + qty_asked
-            parts = _lot_parts(full)
-            if parts:
-                approved_exact[(key, parts)] = approved_exact.get((key, parts), 0) + qty_asked
-
-    def _qty(rec: dict) -> Optional[int]:
+        status = (r.get("Status") or "").strip() or "Under Review"
+        if status.casefold() not in _HOLDING:
+            continue
+        full = r.get("Item Name", "")
+        key = _norm_name(_base_item_name(full))
         try:
-            # float() first: Sheets can export whole numbers as "12.0"
-            return max(int(float(str(rec.get("Quantity") or rec.get("quantity") or "").strip().replace(",", ""))), 0)
+            qty_asked = int(float(str(r.get("Quantity Requested", "0")).strip()))
         except (ValueError, OverflowError):
-            return None
+            qty_asked = 1
+        qty_asked = max(qty_asked, 0)
+        held_by_name[key] = held_by_name.get(key, 0) + qty_asked
+        parts = _lot_parts(full)
+        if parts:
+            held_exact[(key, parts)] = held_exact.get((key, parts), 0) + qty_asked
 
     # A request line that names its lot ("[Lot X, Box Y, Pallet Z]") holds that exact row, so it does
     # not reduce another manufacturer's or lot's row of the same name. Whatever is left, and lines
     # without a lot, are spread over the name's rows in order (first lot first), so a small lot reads 0
-    # after a small approval and a big lot is not reduced by it.
+    # after a small request and a big lot is not reduced by it.
     def _row_key(rec: dict):
         name = _norm_name((rec.get("Name") or rec.get("name") or "").strip())
         parts = tuple(_norm_name(str(rec.get(col) or "").strip()) for col in ("Lot Number", "Box Number", "Pallet Number"))
         return name, parts
 
     held_by_row: dict[int, int] = {}
-    left_to_hold = dict(approved_by_name)
-    exact_left = dict(approved_exact)
+    left_to_hold = dict(held_by_name)
+    exact_left = dict(held_exact)
     for idx, rec in enumerate(inventory):
-        qty = _qty(rec)
+        qty = _stock(rec)
         rk = _row_key(rec)
         if qty is None or not exact_left.get(rk):
             continue
         held_by_row[idx] = min(qty, exact_left[rk])
         exact_left[rk] -= held_by_row[idx]
         left_to_hold[rk[0]] -= held_by_row[idx]
-    result = []
+    remaining: list[Optional[int]] = []
     for idx, rec in enumerate(inventory):
-        item_name = (rec.get("Name") or rec.get("name") or "").strip()
-        category = (rec.get("Category") or rec.get("category") or "").strip()
-        sheet_row = rec.get("_sheet_row")
-        qty = _qty(rec)
-        key = _norm_name(item_name)
+        qty = _stock(rec)
+        key = _norm_name((rec.get("Name") or rec.get("name") or "").strip())
         held = held_by_row.get(idx, 0)
         if qty is not None and left_to_hold.get(key) and qty - held > 0:
             extra = min(qty - held, left_to_hold[key])
             held += extra
             left_to_hold[key] -= extra
+        remaining.append(None if qty is None else qty - held)
+    return remaining, {k for k, v in held_by_name.items() if v}
 
-        if qty is None:  # blank or unparseable stock: unknown, not low
-            remaining = None
+
+def _check_enough_left(body: "OrgRequestBody") -> None:
+    """Refuse (409) a request for more than is left of a batch, saying how many are left. Run under
+    _claim_lock, together with saving the request, so two clinics can't take the same last units."""
+    try:
+        inventory = get_inventory_records()
+        remaining, _ = _remaining_by_row(inventory, _request_rows_for_holds())
+    except Exception:  # the list can't be read right now: never block a request over it
+        logger.warning("Couldn't check what's left before saving a request", exc_info=True)
+        return
+    by_row = {rec.get("_sheet_row"): idx for idx, rec in enumerate(inventory) if rec.get("_sheet_row") is not None}
+    rows_named: dict[str, list[int]] = {}
+    for idx, rec in enumerate(inventory):
+        rows_named.setdefault(_norm_name((rec.get("Name") or rec.get("name") or "").strip()), []).append(idx)
+    # A line names its batch (sheet_row) and is checked against that row; a line without one is
+    # checked against everything left under its name, so no request holds more than exists.
+    wanted: dict[tuple, int] = {}
+    labels: dict[tuple, str] = {}
+    for item in body.items:
+        idx = by_row.get(item.sheet_row) if item.sheet_row is not None else None
+        if idx is not None:
+            key = (idx,)
         else:
-            remaining = qty - held
-        if remaining is None:
+            key = tuple(rows_named.get(_norm_name(_base_item_name(item.item_name)), ()))
+            if not key:
+                continue  # not in the inventory: nothing to check against
+        if any(remaining[i] is None for i in key):
+            continue  # the sheet has no count for it
+        wanted[key] = wanted.get(key, 0) + item.quantity
+        labels[key] = _base_item_name(item.item_name)
+    left_for = {key: sum(max(remaining[i], 0) for i in key) for key in wanted}
+    short = [(labels[key], left_for[key]) for key, n in wanted.items() if n > left_for[key]]
+    if not short:
+        return
+    parts = [f"{name}: {'none left' if left == 0 else f'only {left} left'}" for name, left in short]
+    raise HTTPException(status_code=409, detail=(
+        "Not enough left for this request (another clinic may have just asked for some). "
+        + "; ".join(parts) + ". Change the amounts on your list, or remove those supplies, then send again."))
+
+
+@app.get("/inventory/availability")
+async def inventory_availability(request: Request):
+    inventory = get_inventory_records()
+    remaining_rows, held_names = _remaining_by_row(inventory, _request_rows_for_holds())
+    result = []
+    for idx, rec in enumerate(inventory):
+        item_name = (rec.get("Name") or rec.get("name") or "").strip()
+        category = (rec.get("Category") or rec.get("category") or "").strip()
+        sheet_row = rec.get("_sheet_row")
+        remaining = remaining_rows[idx]
+        if remaining is None:  # blank or unparseable stock: unknown, not low
             availability_status, tags = "Available", ["Available"]
-        elif approved_by_name.get(key) and remaining <= 0:
+        elif _norm_name(item_name) in held_names and remaining <= 0:
             availability_status, tags = "Requested", ["Requested"]
         elif remaining <= 5:
             availability_status, tags = "Limited", ["Low Stock"]
@@ -1542,26 +1779,49 @@ async def inventory_availability(request: Request):
     return _cached_json(request, result)
 
 
-@app.get("/requests")
-async def list_org_requests(request: Request, response: Response, email: Optional[str] = None,
-                            x_hq_token: Optional[str] = Header(default=None),
-                            x_team_session: Optional[str] = Header(default=None)):
-    """Org view: ?email=<exact address, case-insensitive> returns only that org's lines.
+def _sent_since(timestamp, since) -> bool:
+    """Was this request line sent at or after `since` (the account's creation)? A line with no
+    readable time counts as older, so it stays hidden."""
+    if since is None:
+        return True
+    try:
+        sent = timestamp if isinstance(timestamp, datetime) else datetime.fromisoformat(str(timestamp).strip())
+    except ValueError:
+        return False
+    if sent.tzinfo is None:
+        sent = sent.replace(tzinfo=timezone.utc)
+    return sent >= since
 
-    Without a non-empty email this is the HQ view of ALL requests, which needs the
+
+@app.get("/requests")
+def list_org_requests(request: Request, response: Response, email: Optional[str] = None,
+                      x_hq_token: Optional[str] = Header(default=None)):
+    """Clinic view (?email=): only for the signed-in account with that email, and only requests
+    sent after the account was made. Sign-up proves nothing about the inbox, so someone who
+    signs up with another clinic's address must not see that clinic's earlier requests.
+
+    Without a non-empty email this is the HQ view of ALL requests: a team account, or the
     X-HQ-Token header (disabled with 403 when HQ_API_TOKEN is not set).
     """
     response.headers["Cache-Control"] = "no-store"  # per-clinic data must never be cached
     wanted = (email or "").strip().lower()
+    since = None
     if not wanted:
-        require_hq(x_hq_token, x_team_session)
+        require_hq(request, x_hq_token)
     else:
         _check_rate("lookup:" + _client_ip(request), LOOKUP_LIMIT)
+        account = current_account(request)
+        if account is None:
+            raise HTTPException(status_code=401, detail="Please sign in to see your requests.")
+        if account["email"].strip().lower() != wanted:
+            raise HTTPException(status_code=403, detail="You can only see your own requests.")
+        since = account.get("created_at")
 
     def mine(rows: list[dict]) -> list[dict]:
         if not wanted:
             return rows
-        return [r for r in rows if r.get("Org Email", "").strip().lower() == wanted]
+        return [r for r in rows if r.get("Org Email", "").strip().lower() == wanted
+                and _sent_since(r.get("Timestamp"), since)]
 
     if db.enabled():
         return mine(db.get_requests())

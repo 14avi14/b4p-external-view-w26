@@ -40,21 +40,56 @@ test('filters by status and by clinic', () => {
   expect(filterGroups(groups, { status: 'shipped', clinic: 'Hillside Health' })).toEqual([]);
 });
 
-test('the dashboard lists requests and changes a status through the server', async () => {
+const ACCOUNTS = [
+  { email: 'r@x.org', org_name: 'Riverside Clinic', role: 'clinic', created_at: '2026-10-20T10:00:00Z', last_login_at: '', locked: false },
+  { email: 'h@x.org', org_name: 'Hillside Health', role: 'clinic', created_at: '2026-10-21T10:00:00Z', last_login_at: '2026-10-22T10:00:00Z', locked: true },
+];
+
+// A fake server: requests, accounts and reset links. The session is a cookie, so no headers.
+function fakeServer() {
   const calls = [];
   jest.spyOn(global, 'fetch').mockImplementation((url, opts = {}) => {
-    calls.push([url, opts.method || 'GET', opts.headers]);
-    return Promise.resolve({ ok: true, status: 200, json: () => Promise.resolve(opts.method === 'PATCH' ? { ok: true } : ROWS) });
+    calls.push([url, opts.method || 'GET', opts.headers, opts.credentials]);
+    const json = (data) => Promise.resolve({ ok: true, status: 200, json: () => Promise.resolve(data) });
+    if (url.endsWith('/api/team/accounts')) return json(ACCOUNTS);
+    if (url.endsWith('/api/team/accounts/reset-link')) return json({ token: 'T'.repeat(43), hours: 24 });
+    return json(opts.method === 'PATCH' ? { ok: true } : ROWS);
   });
-  render(<TeamDashboard member={{ token: 'sess', name: 'Rhea', email: 'rchokha@umich.edu', position: 'Tech' }} onSignOut={jest.fn()} />);
-  await waitFor(() => expect(screen.getAllByRole('table')).toHaveLength(2));
+  return calls;
+}
+
+const MEMBER = { email: 'rchokha@umich.edu', org: 'Blueprints for Pangaea', role: 'hq' };
+
+test('the dashboard lists requests and changes a status through the server', async () => {
+  const calls = fakeServer();
+  render(<TeamDashboard member={MEMBER} onSignOut={jest.fn()} />);
+  await waitFor(() => expect(screen.getAllByRole('table')).toHaveLength(3));
   const table = screen.getAllByRole('table')[1];
   expect(within(table).getByText('Hillside Health')).toBeInTheDocument();
-  expect(calls[0][2]).toEqual({ 'X-Team-Session': 'sess' });
+  expect(calls[0][3]).toBe('include'); // the session cookie goes with every call
 
   userEvent.selectOptions(screen.getByLabelText('Clinic'), 'Riverside Clinic');
   expect(within(table).queryByText('Hillside Health')).not.toBeInTheDocument();
   userEvent.click(screen.getByRole('button', { name: /^Under review/ }));
   userEvent.click(within(table).getByRole('button', { name: 'Approve' }));
   await waitFor(() => expect(calls.some(([url, method]) => method === 'PATCH' && url.endsWith('/requests/REQ-1/status'))).toBe(true));
+});
+
+test('accounts: find one, make a 24-hour reset link and copy it', async () => {
+  const calls = fakeServer();
+  const writeText = jest.fn(() => Promise.resolve());
+  Object.assign(navigator, { clipboard: { writeText } });
+  render(<TeamDashboard member={MEMBER} onSignOut={jest.fn()} />);
+  const accounts = await screen.findByRole('region', { name: 'Accounts' });
+  await within(accounts).findByText('Hillside Health');
+  expect(within(accounts).getByText(/locked for now/)).toBeInTheDocument();
+  userEvent.type(within(accounts).getByLabelText('Find an account'), 'river');
+  expect(within(accounts).queryByText('Hillside Health')).not.toBeInTheDocument();
+  userEvent.click(within(accounts).getByRole('button', { name: 'Reset password' }));
+  const link = await within(accounts).findByLabelText('Reset link for r@x.org');
+  expect(link.value).toMatch(/#\/reset\/T{43}$/);
+  const sent = calls.find(([url]) => url.endsWith('/reset-link'));
+  expect(sent[1]).toBe('POST');
+  userEvent.click(within(accounts).getByRole('button', { name: 'Copy' }));
+  expect(writeText).toHaveBeenCalledWith(link.value);
 });

@@ -65,6 +65,7 @@ export async function apiRequest(path, { method = 'GET', body, headers, timeout 
       method,
       headers: body || headers ? { ...(body ? { 'Content-Type': 'application/json' } : {}), ...headers } : undefined,
       body: body ? JSON.stringify(body) : undefined,
+      credentials: 'include', // the account session cookie (the API is on another port locally)
       signal: controller.signal,
       ...(cache ? { cache } : {}),
     });
@@ -92,21 +93,25 @@ export const getAvailability = (opts) => apiRequest('/inventory/availability', o
 export const getMyRequests = (email, opts) => apiRequest(`/requests?email=${encodeURIComponent(email)}`, opts);
 export const submitRequest = (payload, opts) => apiRequest('/requests', { ...opts, method: 'POST', body: payload });
 
-// Blueprints team (preview): sign in with a roster email and a 6-digit code, then every HQ call
-// sends the session in X-Team-Session (checked by require_hq on the server).
-const team = (session) => ({ 'X-Team-Session': session });
-export const teamSignIn = (email) => apiRequest('/api/team/sign-in', { method: 'POST', body: { email } });
-export const teamVerify = (email, code) => apiRequest('/api/team/verify', { method: 'POST', body: { email, code } });
-export const teamMe = (session) => apiRequest('/api/team/me', { headers: team(session), cache: 'no-store' });
-export const teamSignOut = (session) => apiRequest('/api/team/sign-out', { method: 'POST', headers: team(session) });
-export const getAllRequests = (session, opts) =>
-  apiRequest('/requests', { ...opts, headers: team(session), cache: 'no-store' });
-export const setRequestStatus = (id, status, session) =>
-  apiRequest(`/requests/${encodeURIComponent(id)}/status`, { method: 'PATCH', body: { status }, headers: team(session) });
+// Accounts: email + password. The server keeps the session in an HttpOnly cookie (sent with every
+// call, see `credentials` above), so the page never holds a token. Team accounts have role "hq".
+export const signUp = (email, orgName, password) =>
+  apiRequest('/api/auth/signup', { method: 'POST', body: { email, org_name: orgName, password } });
+export const logIn = (email, password) => apiRequest('/api/auth/login', { method: 'POST', body: { email, password } });
+export const logOut = () => apiRequest('/api/auth/logout', { method: 'POST' });
+export const accountMe = () => apiRequest('/api/auth/me', { cache: 'no-store' });
+export const changePassword = (currentPassword, newPassword) =>
+  apiRequest('/api/auth/password/change', { method: 'POST', body: { current_password: currentPassword, new_password: newPassword } });
+export const resetPassword = (token, password) =>
+  apiRequest('/api/auth/password/reset', { method: 'POST', body: { token, password } });
+// Does the email's domain exist and take mail? Only the domain is sent. Short timeout: this is a
+// hint, never a reason to stop someone signing up.
+export const checkEmailDomain = (domain) =>
+  apiRequest(`/api/auth/check-email?domain=${encodeURIComponent(domain)}`, { timeout: 4000, cache: 'no-store' });
 
-// Clinic sign-in: an email, then a 6-digit code. The server sends back a signed ticket with the
-// code request; the page sends it back with the code. The session goes in X-Clinic-Session.
-export const clinicSignIn = (email) => apiRequest('/api/auth/sign-in', { method: 'POST', body: { email } });
-export const clinicVerify = (email, code, ticket) =>
-  apiRequest('/api/auth/verify', { method: 'POST', body: { email, code, ticket } });
-export const clinicMe = (token) => apiRequest('/api/auth/me', { headers: { 'X-Clinic-Session': token }, cache: 'no-store' });
+// Blueprints team (role "hq" accounts).
+export const getAllRequests = (opts) => apiRequest('/requests', { ...opts, cache: 'no-store' });
+export const setRequestStatus = (id, status) =>
+  apiRequest(`/requests/${encodeURIComponent(id)}/status`, { method: 'PATCH', body: { status } });
+export const getAccounts = () => apiRequest('/api/team/accounts', { cache: 'no-store' });
+export const makeResetLink = (email) => apiRequest('/api/team/accounts/reset-link', { method: 'POST', body: { email } });

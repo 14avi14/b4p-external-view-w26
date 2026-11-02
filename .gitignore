@@ -24,3 +24,10 @@ mockups/
 .claude/
 .impeccable/
 members.local.json
+
+# Local only: clinic and team accounts while testing without the database (app/accounts.py).
+.local-accounts.sqlite3*
+
+# Local only: parked webhook settings and .env backups (secrets).
+.env.*
+!.env.example

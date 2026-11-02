@@ -95,7 +95,7 @@ def test_full_lifecycle_with_emails(client, no_email, monkeypatch):
     assert {x["Item Name"] for x in mine} == {a, b} and {x["Request ID"] for x in mine} == {rid}
     assert {x["Status"] for x in mine} == {"Under Review"}
     assert client.get("/requests", params={"email": "someone.else@example.org"}).json() == []
-    assert _status(client, a) == "Available"  # Under Review holds nothing
+    assert _status(client, a) == "Requested"  # Under Review holds it: all of a was asked for
 
     # Approved: one status email to the clinic, and now the stock is held
     assert _patch(client, rid, "Approved").status_code == 200
@@ -194,9 +194,9 @@ def test_live_sheet_lifecycle(live_sheet, no_email, monkeypatch):  # noqa: F811
     rid = c.post("/requests", json={"org_name": "Sheet Clinic", "org_email": email,
                                     "items": [{"item_name": "Gauze", "quantity": 8}]}).json()["request_id"]
     assert len(no_email) == 2
-    assert _status(c, "Gauze") == "Available"  # nothing Approved yet (the seeded row is Under Review)
+    assert _status(c, "Gauze") == "Requested"  # 10 - 2 (seeded, Under Review) - 8 = 0
     assert _patch(c, rid, "Approved").status_code == 200 and len(no_email) == 3
-    assert _status(c, "Gauze") == "Limited"  # 10 - 8 approved = 2
+    assert _status(c, "Gauze") == "Requested"  # still held once Approved
     assert _patch(c, rid, "Approved").json().get("changed") is False and len(no_email) == 3
     assert _patch(c, rid, "Shipped").status_code == 200 and len(no_email) == 4
     assert _status(c, "Gauze") == "Available"
@@ -237,7 +237,7 @@ def shaped(monkeypatch, tmp_path):
 
 
 def _req(c, name, qty, approve=True):
-    """Submit a request and (by default) approve it: only Approved requests hold stock."""
+    """Submit a request and (by default) approve it. Under Review and Approved both hold stock."""
     r = c.post("/requests", json={"org_name": "Shape", "org_email": "shape@example.org",
                                   "items": [{"item_name": name, "quantity": qty}]})
     assert r.status_code == 200, r.text
@@ -306,10 +306,15 @@ def test_decimal_quantity_is_parsed(shaped):
     assert row["availability_status"] == "Available" and row["remaining"] == 12
 
 
-def test_over_request_is_accepted_and_marks_requested(shaped):
-    """The API does not cap at stock (UI must); asking for more than exists holds all of it."""
+def test_asking_for_more_than_exists_is_refused_and_holds_nothing(shaped):
+    """No request holds more than exists: the clinic is told how many are left instead."""
     c, _ = shaped
-    _req(c, "Five Left", 10000)
+    before = c.get("/inventory/availability").json()
+    r = c.post("/requests", json={"org_name": "Shape", "org_email": "shape@example.org",
+                                  "items": [{"item_name": "Five Left", "quantity": 10000}]})
+    assert r.status_code == 409 and "Five Left: only 5 left" in r.json()["detail"]
+    assert c.get("/inventory/availability").json() == before
+    _req(c, "Five Left", 5, approve=False)  # exactly what's left is fine
     assert _by_name(c, "Five Left") == ["Requested"]
 
 
@@ -390,11 +395,13 @@ def _remaining(c, name):
             if a["item_name"].lower() == name.strip().lower()]
 
 
-def test_under_review_holds_nothing(shaped):
+def test_under_review_holds_stock_until_denied(shaped):
     c, _ = shaped
     before = c.get("/inventory/availability").json()
-    _req(c, "Six Left", 6, approve=False)
-    assert c.get("/inventory/availability").json() == before
+    rid = _req(c, "Six Left", 6, approve=False)
+    assert _by_name(c, "Six Left") == ["Requested"]  # a clinic asked for all 6: none left for others
+    assert _patch(c, rid, "Denied").status_code == 200
+    assert c.get("/inventory/availability").json() == before  # denied: the 6 are back
 
 
 def test_approved_quantity_fills_same_named_rows_first_lot_first(shaped):

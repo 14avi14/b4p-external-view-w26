@@ -1,50 +1,53 @@
 import { useCallback, useEffect, useState } from 'react';
-import { clinicMe } from './api';
+import { accountMe, logOut } from './api';
 import { readJSON, writeJSON } from './storage';
 
-// The signed-in clinic: {email, org, token}. The token is a signed session from the server
-// (POST /api/auth/verify), checked with GET /api/auth/me when the page opens.
-const KEY = 'b4p.session.v2';
-// Clinic names by email, so signing in again on this device skips the "clinic name" step.
-const ORGS_KEY = 'b4p.clinics.v1';
+// The signed-in account: {email, org, role} ("clinic" or "hq" for the Blueprints team). The session
+// itself is an HttpOnly cookie the page can't read; this copy only lets the header show who is
+// signed in at once, and GET /api/auth/me confirms it (or signs out) when the page opens.
+const KEY = 'b4p.account.v3';
 
-const valid = (s) => (s && typeof s.email === 'string' && typeof s.org === 'string' && typeof s.token === 'string' ? s : null);
+const valid = (s) => (s && typeof s.email === 'string' && typeof s.org === 'string'
+  && (s.role === 'clinic' || s.role === 'hq') ? s : null);
 
-export const knownOrg = (email) => {
-  const orgs = readJSON(ORGS_KEY, {});
-  return orgs && typeof orgs[email] === 'string' ? orgs[email] : '';
-};
+// The server's {email, org_name, role} as the page uses it.
+export const fromServer = (me) => valid({ email: me.email, org: me.org_name, role: me.role });
 
 export default function useAccount() {
   const [account, setAccount] = useState(() => valid(readJSON(KEY, null)));
-  const [checked, setChecked] = useState(!account);
 
+  // Ask the server once per visit: the cookie may have expired, or a password reset ended it.
+  // Only when this browser was signed in: for everyone else the answer is a known "no" (a 401
+  // that would only add an error line to the browser console).
+  const wasSignedIn = !!account;
   useEffect(() => {
-    if (!account || checked) return undefined;
+    if (!wasSignedIn) return undefined;
     let live = true;
-    clinicMe(account.token)
-      .then(() => live && setChecked(true))
-      .catch((err) => {
+    accountMe()
+      .then((me) => {
         if (!live) return;
-        if (err.status === 401) {
+        const next = fromServer(me);
+        writeJSON(KEY, next);
+        setAccount(next);
+      })
+      .catch((err) => {
+        if (live && err.status === 401) {
           writeJSON(KEY, null);
           setAccount(null);
         }
-        setChecked(true);
       });
     return () => { live = false; };
-  }, [account, checked]);
+  }, [wasSignedIn]);
 
   const signedIn = useCallback((next) => {
-    writeJSON(ORGS_KEY, { ...readJSON(ORGS_KEY, {}), [next.email]: next.org });
     writeJSON(KEY, next);
     setAccount(next);
-    setChecked(true);
   }, []);
 
   const signOut = useCallback(() => {
-    setAccount(null);
+    logOut().catch(() => {}); // the cookie is cleared by the server; the page forgets now either way
     writeJSON(KEY, null);
+    setAccount(null);
   }, []);
 
   return { account, signedIn, signOut };
