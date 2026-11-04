@@ -5,9 +5,9 @@ service-account key needed, just the web app's URL and a shared secret.
   REQUESTS_WEBHOOK_SECRET  the same secret the script checks
 
 The sheet and tab are fixed here, not in settings:
-  - on Vercel (the live site): the "Requests" tab of the Requests spreadsheet, the real one,
-    already holding requests since May 2026. That needs its own Apps Script deployment (from
-    requests-apps-script.gs) made on the Requests spreadsheet, and its URL set on Vercel.
+  - on Vercel (the live site): the "Local Shipments" tab of the "Master Shipment Database" spreadsheet.
+    That needs its own Apps Script deployment (from
+    requests-apps-script.gs) made on that spreadsheet, and its URL set on Vercel.
   - anywhere else (testing on a computer): "Sheet1" of the "temp request sheet".
 Rows use exactly the Requests tab's existing columns and formats (ORG_REQ_HEADERS in main.py),
 one per supply.
@@ -44,7 +44,7 @@ BACKOFF = 1.0  # seconds before the retry
 REAL_HOSTS = ("script.google.com", "script.googleusercontent.com")
 
 # (spreadsheet id, tab). The Apps Script only accepts these two pairs.
-PRODUCTION = ("1k0rX_GZEkFppF8hC_JtN7pM9pRHEuHeYOXcsSJ23TTY", "Requests")  # "Requests" spreadsheet
+PRODUCTION = ("1M4d2QYA90Ma3_Zkyh0l2oED-tqeRPDIaeUxF2Ovyao0", "Local Shipments")  # "Master Shipment Database" spreadsheet
 TESTING = ("1MDJRufxw3AKp2pj4CoKegS1hbBAcjkqWOoHHleAKnCE", "Sheet1")  # "temp request sheet"
 
 _last: dict = {}

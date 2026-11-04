@@ -104,12 +104,12 @@ def test_local_runs_write_to_sheet1_and_vercel_to_requests(app, monkeypatch):
     client, posts, _ = app
     submit(client)
     monkeypatch.setenv("VERCEL", "1")
-    assert request_webhook.tab() == "Requests"
+    assert request_webhook.tab() == "Local Shipments"
     monkeypatch.setattr(main, "_sample_org_request_rows", [])
     submit(client)  # (the in-memory store still answers; only the tab name matters here)
     assert [(p["json"]["sheet_id"], p["json"]["tab"]) for p in posts] == [
         ("1MDJRufxw3AKp2pj4CoKegS1hbBAcjkqWOoHHleAKnCE", "Sheet1"),  # testing: temp request sheet
-        ("1k0rX_GZEkFppF8hC_JtN7pM9pRHEuHeYOXcsSJ23TTY", "Requests"),  # live site: the Requests sheet
+        ("1M4d2QYA90Ma3_Zkyh0l2oED-tqeRPDIaeUxF2Ovyao0", "Local Shipments"),  # live site: Master Shipment Database
     ]
 
 
