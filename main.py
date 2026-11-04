@@ -626,7 +626,10 @@ def _open_spreadsheet():
 
 
 def _open_requests_spreadsheet():
-    sheet_id = os.environ.get("REQUESTS_SHEET_ID") or os.environ.get("GOOGLE_SHEET_ID")
+    # The live site writes requests to the same spreadsheet as the request-sheet web app (never the
+    # inventory sheet); a computer keeps the older fallback to GOOGLE_SHEET_ID.
+    sheet_id = os.environ.get("REQUESTS_SHEET_ID") or (
+        request_webhook.target()[0] if os.environ.get("VERCEL") else os.environ.get("GOOGLE_SHEET_ID"))
     if not sheet_id:
         raise HTTPException(status_code=500, detail="Missing REQUESTS_SHEET_ID.")
     client = _gspread_client()
@@ -1284,7 +1287,8 @@ def _client_id_conflict() -> HTTPException:
 
 
 def _org_requests_worksheet(spreadsheet: gspread.Spreadsheet) -> gspread.Worksheet:
-    title = os.environ.get("ORG_REQUESTS_WORKSHEET_TITLE", "Requests").strip()
+    title = (os.environ.get("ORG_REQUESTS_WORKSHEET_TITLE")
+             or (request_webhook.target()[1] if os.environ.get("VERCEL") else "Requests")).strip()
     try:
         ws = spreadsheet.worksheet(title)
     except gspread.WorksheetNotFound:

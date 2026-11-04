@@ -343,3 +343,25 @@ def test_no_read_back_from_a_real_script_in_tests(app, monkeypatch):
     monkeypatch.setenv("REQUESTS_WEBHOOK_URL", "https://script.google.com/macros/s/REAL/exec")
     client.get("/inventory/availability")
     assert state["reads"] == []
+
+
+def test_on_vercel_the_service_account_writes_to_the_same_live_tab_never_inventory(monkeypatch):
+    opened, titles = [], []
+
+    class Book:
+        def worksheet(self, title):
+            titles.append(title)
+            return FakeWorksheet()
+
+    class Client:
+        def open_by_key(self, key):
+            opened.append(key)
+            return Book()
+
+    monkeypatch.setattr(main, "_gspread_client", lambda: Client())
+    monkeypatch.setenv("VERCEL", "1")
+    monkeypatch.setenv("GOOGLE_SHEET_ID", "inventory-sheet")
+    monkeypatch.delenv("REQUESTS_SHEET_ID", raising=False)
+    monkeypatch.delenv("ORG_REQUESTS_WORKSHEET_TITLE", raising=False)
+    main._org_requests_worksheet(main._open_requests_spreadsheet())
+    assert opened == ["1M4d2QYA90Ma3_Zkyh0l2oED-tqeRPDIaeUxF2Ovyao0"] and titles == ["Local Shipments"]
